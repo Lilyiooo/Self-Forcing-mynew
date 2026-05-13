@@ -1,0 +1,91 @@
+# configs/heterogeneous_cache.yaml
+# Content-aware heterogeneous KV cache compression config
+# Extends self_forcing_dmd.yaml with heterogeneous cache settings
+
+# Inherit all settings from self_forcing_dmd.yaml
+generator_ckpt: /inspire/qb-ilm/project/video-generation/public/wangqiqi/models/checkpoints/ode_init.pt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-1.3B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+lr_critic: 1.0e-06
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+data_path: prompts/vidprom_filtered_extended.txt
+batch_size: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 64
+log_iters: 50
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 20
+- 16
+- 60
+- 104
+distribution_loss: dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 4
+load_raw_video: false
+num_training_frames: 20
+model_kwargs:
+  timestep_shift: 5.0
+
+# ── Heterogeneous KV Cache settings ──────────────────────────────
+heterogeneous_cache:
+  enabled: true
+  Nsink: 8              # sink partition size (latent frames)
+  Nrecent: 4            # recent window size (latent frames)
+  Nmid_tokens: 5000     # mid buffer total token budget
+
+density_estimator:
+  delta_high: 0.7
+  delta_low: 0.3
+  motion_weight: 0.7
+  complexity_weight: 0.3
+
+compressor:
+  d_model: 1536         # auto-overridden by generator.model.dim at runtime; keep as fallback
+  in_ch: 16             # latent channel count
+
+top_k:
+  enabled: false        # enable Dynamic Top-K filtering for mid tokens
+  top_k_tokens: 1000    # number of top-k tokens to retain in attention
+
+# Training settings for compressor
+compressor_training:
+  pretrain_epochs: 20     # number of epochs for HR head pretraining (steps = epochs * 20)
+  pretrain_lr: 1.0e-3     # 1e-3 for visible convergence in limited steps
+  pretrain_batch_size: 2  # batch size for random latent pretrain
+  lambda_recon: 0.1       # weight for reconstruction auxiliary loss
+  warmup_steps: 100       # steps to warm up lambda_recon from 0
+
+# Validation settings for 60s video generation
+val_num_latent_frames: 240   # 240 latent frames → 957 pixel frames at 16fps ≈ 60s
+prompt_path: prompts/validation_60s.txt
+num_val_prompts: 2

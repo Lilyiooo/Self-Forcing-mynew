@@ -92,7 +92,8 @@ class CausalWanSelfAttention(nn.Module):
         block_mask,
         kv_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        mid_kv=None,
     ):
         r"""
         Args:
@@ -101,6 +102,7 @@ class CausalWanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             block_mask (BlockMask)
+            mid_kv(Tensor, optional): Shape (2, B, N_mid, n_heads, head_dim) from heterogeneous cache
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
@@ -226,10 +228,21 @@ class CausalWanSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
+            # Build the key/value tensors for attention: [sink | mid_compressed | recent]
+            attn_k = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            attn_v = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+
+            # Inject mid buffer compressed KV if available
+            if mid_kv is not None:
+                mid_k = mid_kv[0]  # (B, N_mid, n_heads, head_dim)
+                mid_v = mid_kv[1]  # (B, N_mid, n_heads, head_dim)
+                attn_k = torch.cat([attn_k, mid_k], dim=1)
+                attn_v = torch.cat([attn_v, mid_v], dim=1)
+
             x = attention(
                 roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                attn_k,
+                attn_v
             )
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
@@ -293,7 +306,8 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        mid_kv=None,
     ):
         r"""
         Args:
@@ -302,6 +316,7 @@ class CausalWanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            mid_kv(Tensor, optional): Shape (2, B, N_mid, n_heads, head_dim) from heterogeneous cache
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         # assert e.dtype == torch.float32
@@ -313,7 +328,7 @@ class CausalWanAttentionBlock(nn.Module):
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start)
+            freqs, block_mask, kv_cache, current_start, cache_start, mid_kv=mid_kv)
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -720,7 +735,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        mid_kv_per_layer: list = None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -810,12 +826,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             return custom_forward
 
         for block_index, block in enumerate(self.blocks):
+            # Get per-layer mid_kv if available
+            _mid_kv = None
+            if mid_kv_per_layer is not None and block_index < len(mid_kv_per_layer):
+                _mid_kv = mid_kv_per_layer[block_index]
+
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 kwargs.update(
                     {
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "mid_kv": _mid_kv,
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -829,7 +851,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "mid_kv": _mid_kv,
                     }
                 )
                 x = block(x, **kwargs)

@@ -5,6 +5,9 @@ from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 
+# NOTE: model.* imports are done lazily inside __init__ to avoid circular import:
+#   pipeline/__init__ → causal_inference → model/__init__ → base → pipeline (cycle)
+
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -16,6 +19,14 @@ class CausalInferencePipeline(torch.nn.Module):
             vae=None
     ):
         super().__init__()
+        # Lazy imports to avoid circular dependency (pipeline ↔ model.base)
+        from model.density_estimator import DensityEstimator
+        from model.compress import HeterogeneousCompressor
+        from model.kv_cache import HeterogeneousKVCache
+        self._DensityEstimator = DensityEstimator
+        self._HeterogeneousCompressor = HeterogeneousCompressor
+        self._HeterogeneousKVCache = HeterogeneousKVCache
+
         # Step 1: Initialize all models
         self.generator = WanDiffusionWrapper(
             **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
@@ -33,6 +44,14 @@ class CausalInferencePipeline(torch.nn.Module):
         self.num_transformer_blocks = 30
         self.frame_seq_length = 1560
 
+        # Read actual transformer dimensions from generator model
+        self.model_dim = getattr(self.generator.model, 'dim', 1536)
+        self.model_num_heads = getattr(self.generator.model, 'num_heads', 12)
+        self.model_head_dim = self.model_dim // self.model_num_heads
+        self.model_num_layers = getattr(self.generator.model, 'num_layers', 30)
+        # Override hardcoded values with actual model config
+        self.num_transformer_blocks = self.model_num_layers
+
         self.kv_cache1 = None
         self.args = args
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
@@ -43,6 +62,28 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
+
+        # Step 3: Initialize heterogeneous KV cache components
+        self.heterogeneous_cache_enabled = False
+        het_cfg = getattr(args, "heterogeneous_cache", None)
+        if het_cfg is not None and getattr(het_cfg, "enabled", False):
+            self.heterogeneous_cache_enabled = True
+            self.het_cache_config = het_cfg
+            print(f"Heterogeneous KV cache enabled: Nsink={het_cfg.Nsink}, "
+                  f"Nrecent={het_cfg.Nrecent}, Nmid_tokens={het_cfg.Nmid_tokens}")
+
+            # Density estimator
+            density_cfg = getattr(args, "density_estimator", None)
+            self.density_estimator = self._DensityEstimator(
+                high_threshold=getattr(density_cfg, "delta_high", 0.67),
+                low_threshold=getattr(density_cfg, "delta_low", 0.33),
+                motion_weight=getattr(density_cfg, "motion_weight", 0.6),
+                complexity_weight=getattr(density_cfg, "complexity_weight", 0.4),
+            )
+
+            # Compressor (will be initialized lazily on first device placement)
+            self.compressor = None
+            self.het_kv_cache = None
 
     def inference(
         self,
@@ -108,28 +149,33 @@ class CausalInferencePipeline(torch.nn.Module):
             block_end = torch.cuda.Event(enable_timing=True)
             init_start.record()
 
-        # Step 1: Initialize KV cache to all zeros
-        if self.kv_cache1 is None:
-            self._initialize_kv_cache(
-                batch_size=batch_size,
-                dtype=noise.dtype,
-                device=noise.device
-            )
-            self._initialize_crossattn_cache(
-                batch_size=batch_size,
-                dtype=noise.dtype,
-                device=noise.device
+        # Step 1: Initialize KV cache
+        if self.heterogeneous_cache_enabled:
+            self._initialize_heterogeneous_cache(
+                batch_size=batch_size, dtype=noise.dtype, device=noise.device
             )
         else:
-            # reset cross attn cache
-            for block_index in range(self.num_transformer_blocks):
-                self.crossattn_cache[block_index]["is_init"] = False
-            # reset kv cache
-            for block_index in range(len(self.kv_cache1)):
-                self.kv_cache1[block_index]["global_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
-                self.kv_cache1[block_index]["local_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
+            if self.kv_cache1 is None:
+                self._initialize_kv_cache(
+                    batch_size=batch_size,
+                    dtype=noise.dtype,
+                    device=noise.device
+                )
+                self._initialize_crossattn_cache(
+                    batch_size=batch_size,
+                    dtype=noise.dtype,
+                    device=noise.device
+                )
+            else:
+                # reset cross attn cache
+                for block_index in range(self.num_transformer_blocks):
+                    self.crossattn_cache[block_index]["is_init"] = False
+                # reset kv cache
+                for block_index in range(len(self.kv_cache1)):
+                    self.kv_cache1[block_index]["global_end_index"] = torch.tensor(
+                        [0], dtype=torch.long, device=noise.device)
+                    self.kv_cache1[block_index]["local_end_index"] = torch.tensor(
+                        [0], dtype=torch.long, device=noise.device)
 
         # Step 2: Cache context feature
         current_start_frame = 0
@@ -140,13 +186,11 @@ class CausalInferencePipeline(torch.nn.Module):
                 assert (num_input_frames - 1) % self.num_frame_per_block == 0
                 num_input_blocks = (num_input_frames - 1) // self.num_frame_per_block
                 output[:, :1] = initial_latent[:, :1]
-                self.generator(
+                self._run_generator(
                     noisy_image_or_video=initial_latent[:, :1],
                     conditional_dict=conditional_dict,
                     timestep=timestep * 0,
-                    kv_cache=self.kv_cache1,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length,
+                    current_start_frame=current_start_frame,
                 )
                 current_start_frame += 1
             else:
@@ -158,13 +202,11 @@ class CausalInferencePipeline(torch.nn.Module):
                 current_ref_latents = \
                     initial_latent[:, current_start_frame:current_start_frame + self.num_frame_per_block]
                 output[:, current_start_frame:current_start_frame + self.num_frame_per_block] = current_ref_latents
-                self.generator(
+                self._run_generator(
                     noisy_image_or_video=current_ref_latents,
                     conditional_dict=conditional_dict,
                     timestep=timestep * 0,
-                    kv_cache=self.kv_cache1,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length,
+                    current_start_frame=current_start_frame,
                 )
                 current_start_frame += self.num_frame_per_block
 
@@ -177,7 +219,11 @@ class CausalInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
-        for current_num_frames in all_num_frames:
+
+        # For heterogeneous cache: track previous chunk latent for density estimation
+        z_prev_chunk = None
+
+        for chunk_idx, current_num_frames in enumerate(all_num_frames):
             if profile:
                 block_start.record()
 
@@ -194,13 +240,11 @@ class CausalInferencePipeline(torch.nn.Module):
                     dtype=torch.int64) * current_timestep
 
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
+                    _, denoised_pred = self._run_generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
                         timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start_frame=current_start_frame,
                     )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -211,13 +255,11 @@ class CausalInferencePipeline(torch.nn.Module):
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
                     # for getting real output
-                    _, denoised_pred = self.generator(
+                    _, denoised_pred = self._run_generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
                         timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start_frame=current_start_frame,
                     )
 
             # Step 3.2: record the model's output
@@ -225,14 +267,22 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
+            self._run_generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=conditional_dict,
                 timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
+                current_start_frame=current_start_frame,
             )
+
+            # Step 3.3a: Heterogeneous cache - density estimation and compression
+            if self.heterogeneous_cache_enabled:
+                self._maybe_compress_block(
+                    denoised_pred=denoised_pred,
+                    chunk_idx=chunk_idx,
+                    current_start_frame=current_start_frame,
+                    z_prev_chunk=z_prev_chunk,
+                )
+                z_prev_chunk = denoised_pred.detach().clone()
 
             if profile:
                 block_end.record()
@@ -310,3 +360,148 @@ class CausalInferencePipeline(torch.nn.Module):
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache
+
+    # ------------------------------------------------------------------
+    # Heterogeneous cache methods
+    # ------------------------------------------------------------------
+
+    def _initialize_heterogeneous_cache(self, batch_size, dtype, device):
+        """Initialize the heterogeneous KV cache (three-zone structure)."""
+        het_cfg = self.het_cache_config
+        Nsink = getattr(het_cfg, "Nsink", 8)
+        Nrecent = getattr(het_cfg, "Nrecent", 4)
+
+        # Compute effective attention window for KV cache eviction:
+        # sink frames + recent window + 1 block buffer for current write
+        effective_window = Nsink + Nrecent + self.num_frame_per_block
+
+        # Update the model's attention layers to enable eviction with the
+        # correct window size and sink retention.  Without this the model
+        # uses local_attn_size=-1 which disables eviction entirely, and the
+        # fixed-size KV cache overflows for long videos (>21 latent frames).
+        self.generator.model.local_attn_size = effective_window
+        for block in self.generator.model.blocks:
+            block.self_attn.local_attn_size = effective_window
+            block.self_attn.sink_size = Nsink
+            block.self_attn.max_attention_size = effective_window * self.frame_seq_length
+        self.local_attn_size = effective_window
+
+        # Initialize the compressor (lazy, on first call)
+        if self.compressor is None:
+            compressor_cfg = getattr(self.args, "compressor", None)
+            in_ch = getattr(compressor_cfg, "in_ch", 16)
+            # Use actual model hidden dim as d_model for KV compatibility
+            d_model = self.model_dim
+            self.compressor = self._HeterogeneousCompressor(
+                vae=self.vae,
+                d_model=d_model,
+                in_ch=in_ch,
+            ).to(device=device, dtype=dtype)
+
+        # Initialize the heterogeneous KV cache
+        self.het_kv_cache = self._HeterogeneousKVCache(
+            batch_size=batch_size,
+            num_transformer_blocks=self.num_transformer_blocks,
+            num_heads=self.model_num_heads,
+            head_dim=self.model_head_dim,
+            dtype=dtype,
+            device=device,
+            Nsink=Nsink,
+            Nrecent=Nrecent,
+            Nmid_tokens=getattr(het_cfg, "Nmid_tokens", 5000),
+            frame_seq_length=self.frame_seq_length,
+            local_attn_size=effective_window,
+        )
+
+        # Reset density estimator
+        self.density_estimator.reset_stats()
+
+        # Set up the old-style caches as aliases for backward compatibility
+        self.kv_cache1 = [self.het_kv_cache.get_layer_cache(i) for i in range(self.num_transformer_blocks)]
+        self.crossattn_cache = [self.het_kv_cache.get_crossattn_cache(i) for i in range(self.num_transformer_blocks)]
+
+    def _run_generator(self, noisy_image_or_video, conditional_dict, timestep, current_start_frame):
+        """Run generator with or without heterogeneous cache."""
+        if self.heterogeneous_cache_enabled and self.het_kv_cache is not None:
+            # Build per-layer mid_kv list
+            mid_kv_per_layer = []
+            for layer_idx in range(self.num_transformer_blocks):
+                mid_kv = self.het_kv_cache.get_mid_kv(layer_idx)
+                mid_kv_per_layer.append(mid_kv)
+
+            return self.generator(
+                noisy_image_or_video=noisy_image_or_video,
+                conditional_dict=conditional_dict,
+                timestep=timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                mid_kv_per_layer=mid_kv_per_layer,
+            )
+        else:
+            return self.generator(
+                noisy_image_or_video=noisy_image_or_video,
+                conditional_dict=conditional_dict,
+                timestep=timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+            )
+
+    @torch.no_grad()
+    def _maybe_compress_block(self, denoised_pred, chunk_idx, current_start_frame, z_prev_chunk):
+        """
+        Compress a finished block and push it into the mid buffer.
+        Only starts compressing after the recent window is full.
+        """
+        if self.het_kv_cache is None or self.compressor is None:
+            return
+
+        # Current chunk latent (for density estimation)
+        z_current = denoised_pred  # (B, T, C, H, W)
+
+        # Estimate density (v2: single call, no dependency on z_prev or LR complexity)
+        density_level, density_score, density_info = self.density_estimator(z_current)
+
+        # Compress: need latent in (B, C, T, H, W) format for compressor
+        z_compress = z_current.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+        compressed_tokens, _complexity_from_lr = self.compressor(z_compress, density_level)
+
+        # Project compressed tokens to KV format for each transformer layer
+        B, N, D = compressed_tokens.shape
+        n_heads = self.model_num_heads
+        head_dim = D // n_heads
+        tokens_4d = compressed_tokens.view(B, N, n_heads, head_dim)
+
+        kv_compressed_per_layer = []
+        for _ in range(self.num_transformer_blocks):
+            # (2, B, N, n_heads, head_dim)
+            kv = torch.stack([tokens_4d, tokens_4d], dim=0)
+            kv_compressed_per_layer.append(kv)
+
+        # Push into mid buffer
+        self.het_kv_cache.push_mid_block(
+            kv_compressed=kv_compressed_per_layer,
+            density_level=density_level,
+            density_score=density_score,
+            temporal_position=current_start_frame,
+        )
+
+        print(f"  [HetCache] chunk {chunk_idx}: density={density_score:.3f} ({density_level}), "
+              f"tokens={N}, mid_total={self.het_kv_cache.mid_token_count}/{self.het_kv_cache.Nmid_tokens}")
+
+        # Optional density logging (used by experiment_A_density_vis)
+        if hasattr(self, '_density_log') and self._density_log is not None:
+            # Optional density logging (used by experiment_A_density_vis)
+            if hasattr(self, '_density_log') and self._density_log is not None:
+                self._density_log.append({
+                    "block_idx": int(chunk_idx),
+                    "time_sec": float(chunk_idx * self.num_frame_per_block * 4 / 16.0),
+                    "motion_score": density_info["raw_motion"],
+                    "complexity_score": density_info["raw_complexity"],
+                    "norm_motion": density_info["norm_motion"],
+                    "norm_complexity": density_info["norm_complexity"],
+                    "density_score": float(density_score),
+                    "tier": density_level,
+                    "tokens_allocated": int(N),
+                })

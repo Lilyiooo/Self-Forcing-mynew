@@ -12,9 +12,15 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import CausVid, DMD, SiD
 import torch
+import torch.nn.functional as F
 import wandb
 import time
 import os
+from einops import rearrange
+
+# Heterogeneous cache imports
+from model.density_estimator import DensityEstimator
+from model.compress import HeterogeneousCompressor
 
 
 class Trainer:
@@ -179,6 +185,161 @@ class Trainer:
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
 
+        # Step 8: Initialize heterogeneous cache components (if enabled)
+        self.heterogeneous_cache_enabled = getattr(
+            self.model, 'heterogeneous_cache_enabled', False)
+        if self.heterogeneous_cache_enabled:
+            # Use compressor created by DMD model (avoids duplicate creation)
+            self.compressor = getattr(self.model, 'compressor', None)
+            if self.compressor is not None:
+                self.compressor = self.compressor.to(device=self.device, dtype=self.dtype)
+
+            compressor_train_cfg = getattr(config, "compressor_training", None)
+            self.lambda_recon = getattr(compressor_train_cfg, "lambda_recon", 0.1) if compressor_train_cfg else 0.1
+            self.recon_warmup_steps = getattr(compressor_train_cfg, "warmup_steps", 100) if compressor_train_cfg else 100
+
+            print(f"Heterogeneous cache training enabled: lambda_recon={self.lambda_recon}, "
+                  f"warmup_steps={self.recon_warmup_steps}")
+        else:
+            self.compressor = None
+
+    def pretrain_compressor(self, num_steps=100):
+        """
+        Pretrain HR compression heads via autoencoder reconstruction.
+        - Uses random latent input (no generator needed, saves huge compute).
+        - Each HR head encodes, its symmetric decoder reconstructs.
+        - Loss = MSE(reconstructed, original) — real information-preserving objective.
+        - LR branch is skipped entirely (no VAE calls during pretrain).
+        - Decoder weights are discarded after pretrain; only HR heads are kept.
+        - Runs in float32 for gradient precision (bfloat16 is too imprecise for pretrain).
+        """
+        if not self.heterogeneous_cache_enabled or self.compressor is None:
+            return
+
+        if self.is_main_process:
+            print("Starting compressor pretrain (autoencoder reconstruction)...")
+
+        # Freeze backbone
+        for param in self.model.generator.parameters():
+            param.requires_grad_(False)
+
+        # Only train HR heads + decoders (skip LR branch and proj)
+        for name, param in self.compressor.named_parameters():
+            if "hr_" in name or "decoder_" in name:
+                param.requires_grad_(True)
+            else:
+                param.requires_grad_(False)
+
+        # Temporarily cast HR heads + decoders to float32 for stable gradients
+        pretrain_modules = [
+            self.compressor.hr_high, self.compressor.hr_mid, self.compressor.hr_low,
+            self.compressor.decoder_high, self.compressor.decoder_mid, self.compressor.decoder_low,
+        ]
+        for m in pretrain_modules:
+            m.float()
+
+        compressor_train_cfg = getattr(self.config, "compressor_training", None) or OmegaConf.create({})
+        optimizer = torch.optim.AdamW(
+            [p for p in self.compressor.parameters() if p.requires_grad],
+            lr=getattr(compressor_train_cfg, "pretrain_lr", 1e-3),
+        )
+
+        # Latent shape config (defaults match Wan2.1-T2V at 480p)
+        compressor_cfg = getattr(self.config, "compressor", None) or OmegaConf.create({})
+        in_ch = getattr(compressor_cfg, "in_ch", 16)
+        pretrain_batch_size = getattr(compressor_train_cfg, "pretrain_batch_size", 2)
+        latent_T = getattr(
+            compressor_train_cfg, "latent_T",
+            getattr(self.config, "num_frame_per_block", 3),
+        )
+        latent_H = getattr(compressor_train_cfg, "latent_H", 60)
+        latent_W = getattr(compressor_train_cfg, "latent_W", 104)
+        target_shape = (latent_T, latent_H, latent_W)
+
+        if self.is_main_process:
+            print(f"  latent shape: (B={pretrain_batch_size}, C={in_ch}, T={latent_T}, H={latent_H}, W={latent_W})")
+            print(f"  lr={optimizer.param_groups[0]['lr']}, steps={num_steps}")
+
+        # HR head + decoder pairs
+        head_decoder_pairs = [
+            ("8x",   self.compressor.hr_high, self.compressor.decoder_high),
+            ("32x",  self.compressor.hr_mid,  self.compressor.decoder_mid),
+            ("128x", self.compressor.hr_low,  self.compressor.decoder_low),
+        ]
+
+        for step_idx in range(num_steps):
+            # Random latent in float32 (matches actual latent distribution ~ N(0,1))
+            z_input = torch.randn(
+                pretrain_batch_size, in_ch, *target_shape,
+                device=self.device, dtype=torch.float32,
+            )
+
+            total_loss = torch.tensor(0.0, device=self.device)
+            for name, hr_head, decoder in head_decoder_pairs:
+                compressed = hr_head(z_input)                          # (B, N, D)
+                reconstructed = decoder(compressed, target_shape)      # (B, C, T, H, W)
+                loss = F.mse_loss(reconstructed, z_input)
+                total_loss = total_loss + loss
+
+            optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.compressor.parameters() if p.requires_grad], max_norm=1.0
+            )
+            optimizer.step()
+
+            if step_idx % 10 == 0 and self.is_main_process:
+                print(f"  Compressor pretrain step {step_idx}/{num_steps}, loss={total_loss.item():.4f}")
+
+        # Cast HR heads back to training dtype
+        for m in pretrain_modules:
+            if m is not None:
+                m.to(dtype=self.dtype)
+
+        # Restore trainable states
+        for param in self.model.generator.parameters():
+            param.requires_grad_(True)
+        for param in self.compressor.parameters():
+            param.requires_grad_(True)
+
+        # Discard decoders only if not doing joint PackForcing training
+        # (PackForcing needs decoders for reconstruction auxiliary loss)
+        if not self.heterogeneous_cache_enabled:
+            self.compressor.decoder_high = None
+            self.compressor.decoder_mid = None
+            self.compressor.decoder_low = None
+            if self.is_main_process:
+                print("Compressor pretraining complete. Decoders discarded.")
+        else:
+            if self.is_main_process:
+                print("Compressor pretraining complete. Decoders kept for joint training.")
+
+    def _compute_reconstruction_loss(self, pred_image):
+        """
+        Compute reconstruction auxiliary loss for the compressor.
+        Uses decoders to reconstruct from compressed tokens and compares with original.
+        pred_image: (B, T, C, H, W) denoised prediction from generator
+        """
+        if not self.heterogeneous_cache_enabled or self.compressor is None:
+            return torch.tensor(0.0, device=self.device)
+
+        z_input = pred_image.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+        target_shape = z_input.shape[2:]
+
+        total_loss = torch.tensor(0.0, device=self.device)
+        for level, decoder in [("high", self.compressor.decoder_high),
+                               ("mid", self.compressor.decoder_mid),
+                               ("low", self.compressor.decoder_low)]:
+            if decoder is None:
+                continue
+            compressed, _ = self.compressor(z_input, level)
+            reconstructed = decoder(compressed, target_shape)
+            total_loss = total_loss + F.mse_loss(reconstructed, z_input)
+
+        return total_loss
+
+        return total_loss
+
     def save(self):
         print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(
@@ -250,11 +411,28 @@ class Trainer:
                 initial_latent=image_latent if self.config.i2v else None
             )
 
-            generator_loss.backward()
+            # DMD loss + compressor reconstruction auxiliary loss
+            total_loss = generator_loss
+
+            # Add compressor recon loss if heterogeneous cache enabled
+            if self.heterogeneous_cache_enabled and self.compressor is not None:
+                # Get pred_image from generator_log_dict for recon loss
+                if "pred_image" in generator_log_dict:
+                    recon_loss = self._compute_reconstruction_loss(generator_log_dict["pred_image"])
+                    if self.step >= self.recon_warmup_steps:
+                        lambda_r = self.lambda_recon
+                    else:
+                        # Linear warmup
+                        lambda_r = self.lambda_recon * (self.step / max(1, self.recon_warmup_steps))
+                    total_loss = total_loss + lambda_r * recon_loss
+                    generator_log_dict["recon_loss"] = recon_loss
+                    generator_log_dict["effective_lambda"] = lambda_r
+
+            total_loss.backward()
             generator_grad_norm = self.model.generator.clip_grad_norm_(
                 self.max_grad_norm_generator)
 
-            generator_log_dict.update({"generator_loss": generator_loss,
+            generator_log_dict.update({"generator_loss": total_loss,
                                        "generator_grad_norm": generator_grad_norm})
 
             return generator_log_dict
@@ -309,8 +487,115 @@ class Trainer:
         current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
         return current_video
 
+    @torch.no_grad()
+    def validate(self):
+        """Run inference on a few prompts and save videos for monitoring."""
+        from pipeline import CausalInferencePipeline
+        import imageio
+
+        # Non-rank-0 processes wait at barrier until rank 0 finishes
+        if not self.is_main_process:
+            dist.barrier()
+            return
+
+        print(f"[Validation] Starting at step {self.step}...")
+
+        # Load validation prompts
+        prompt_path = getattr(self.config, "prompt_path", "prompts/validation_60s.txt")
+        with open(prompt_path, "r") as f:
+            all_prompts = [line.strip() for line in f.readlines() if line.strip()]
+        num_val_prompts = min(getattr(self.config, "num_val_prompts", 2), len(all_prompts))
+        val_prompts = all_prompts[:num_val_prompts]
+
+        # Video length: 60s at 16fps ≈ 960 pixel frames
+        # latent_T = (960-1)/4 + 1 ≈ 240 → 957 frames = 59.8s
+        # num_blocks = 240 / num_frame_per_block(3) = 80
+        val_num_latent_frames = getattr(self.config, "val_num_latent_frames", 240)
+
+        # Load checkpoint
+        checkpoint_path = os.path.join(
+            self.output_path, f"checkpoint_model_{self.step:06d}", "model.pt")
+        if not os.path.exists(checkpoint_path):
+            print(f"[Validation] Checkpoint not found: {checkpoint_path}, skipping.")
+            dist.barrier()
+            return
+
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+
+        # Create inference pipeline (fresh non-FSDP models)
+        pipeline = CausalInferencePipeline(args=self.config, device=self.device)
+
+        # Load generator weights (prefer EMA if available)
+        use_ema = "generator_ema" in state_dict and self.generator_ema is not None
+        key = "generator_ema" if use_ema else "generator"
+        print(f"[Validation] Loading {key} weights...")
+        # Strip FSDP/checkpoint prefixes (EMA state_dict may keep them)
+        rename = lambda n: (
+            n.replace("_fsdp_wrapped_module.", "")
+             .replace("_checkpoint_wrapped_module.", "")
+             .replace("_orig_mod.", "")
+        )
+        clean_sd = {rename(k): v for k, v in state_dict[key].items()}
+        pipeline.generator.load_state_dict(clean_sd, strict=True)
+        del state_dict
+
+        pipeline = pipeline.to(dtype=torch.bfloat16)
+        pipeline.generator.to(device=self.device)
+        pipeline.text_encoder.to(device=self.device)
+        pipeline.vae.to(device=self.device)
+
+        # Output directory
+        val_dir = os.path.join(self.output_path, f"validation_step_{self.step:06d}")
+        os.makedirs(val_dir, exist_ok=True)
+
+        for i, prompt in enumerate(val_prompts):
+            noise = torch.randn(
+                [1, val_num_latent_frames, 16, 60, 104],
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            video, _ = pipeline.inference(
+                noise=noise,
+                text_prompts=[prompt],
+                return_latents=True,
+            )
+            current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
+            video_uint8 = (255.0 * current_video).clamp(0, 255).to(torch.uint8)
+            safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in prompt[:60])
+            output_path = os.path.join(val_dir, f"{i}_{safe_name}.mp4")
+            writer = imageio.get_writer(output_path, fps=16, codec="libx264", quality=5)
+            for frame in video_uint8[0].numpy():
+                writer.append_data(frame)
+            writer.close()
+            print(f"[Validation] Saved {output_path}")
+
+            # Clear KV cache between prompts
+            if pipeline.heterogeneous_cache_enabled and pipeline.het_kv_cache is not None:
+                pipeline.het_kv_cache.reset()
+                pipeline.kv_cache1 = [pipeline.het_kv_cache.get_layer_cache(i)
+                                      for i in range(pipeline.num_transformer_blocks)]
+                pipeline.crossattn_cache = [pipeline.het_kv_cache.get_crossattn_cache(i)
+                                            for i in range(pipeline.num_transformer_blocks)]
+            else:
+                pipeline.kv_cache1 = None
+                pipeline.crossattn_cache = None
+
+        # Free memory
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"[Validation] Done. Videos saved to {val_dir}")
+
+        dist.barrier()
+
     def train(self):
         start_step = self.step
+
+        # Phase 2: Pretrain compressor HR heads (if heterogeneous cache enabled)
+        if self.heterogeneous_cache_enabled and self.step == 0:
+            compressor_cfg = getattr(self.config, "compressor_training", None)
+            pretrain_steps = getattr(compressor_cfg, "pretrain_epochs", 5) * 20  # approximate
+            self.pretrain_compressor(num_steps=pretrain_steps)
 
         while True:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
@@ -349,6 +634,7 @@ class Trainer:
                 torch.cuda.empty_cache()
                 self.save()
                 torch.cuda.empty_cache()
+                self.validate()
 
             # Logging
             if self.is_main_process:
@@ -361,6 +647,9 @@ class Trainer:
                             "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                         }
                     )
+                    if "recon_loss" in generator_log_dict:
+                        wandb_loss_dict["recon_loss"] = generator_log_dict["recon_loss"].mean().item()
+                        wandb_loss_dict["effective_lambda"] = generator_log_dict["effective_lambda"]
 
                 wandb_loss_dict.update(
                     {

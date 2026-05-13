@@ -1,15 +1,21 @@
+# configs/uniform_cache.yaml
+# Uniform (non-heterogeneous) KV cache compression config
+# All blocks use the same compression ratio (32x / mid level)
+# Density thresholds are clamped so every block is classified as "mid"
+
+# Inherit all settings from self_forcing_dmd.yaml
 generator_ckpt: /inspire/qb-ilm/project/video-generation/public/wangqiqi/models/checkpoints/ode_init.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
-real_name: Wan2.1-T2V-14B
+real_name: Wan2.1-T2V-1.3B
 text_encoder_fsdp_wrap_strategy: size
 denoising_step_list:
 - 1000
 - 750
 - 500
 - 250
-warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
+warp_denoising_step: true
 ts_schedule: false
 num_train_timestep: 1000
 timestep_shift: 5.0
@@ -23,7 +29,7 @@ wandb_entity: WANDB_ENTITY
 wandb_project: WANDB_PROJECT
 sharding_strategy: hybrid_full
 lr: 2.0e-06
-lr_critic: 4.0e-07
+lr_critic: 1.0e-06
 beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
@@ -38,14 +44,50 @@ negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕�
 dfake_gen_update_ratio: 5
 image_or_video_shape:
 - 1
-- 21
+- 20
 - 16
 - 60
 - 104
 distribution_loss: dmd
 trainer: score_distillation
 gradient_checkpointing: true
-num_frame_per_block: 3
+num_frame_per_block: 4
 load_raw_video: false
+num_training_frames: 20
 model_kwargs:
   timestep_shift: 5.0
+
+# ── KV Cache settings (uniform mode) ─────────────────────────────
+heterogeneous_cache:
+  enabled: true
+  Nsink: 8
+  Nrecent: 4
+  Nmid_tokens: 5000
+
+# Clamp thresholds so ALL blocks are classified as "mid" → always use 32x compression
+density_estimator:
+  delta_high: 1.1         # density never exceeds 1.0, so no "high"
+  delta_low: -0.1         # density never goes below 0.0, so no "low"
+  motion_weight: 0.7
+  complexity_weight: 0.3
+
+compressor:
+  d_model: 1536           # auto-overridden by generator.model.dim at runtime
+  in_ch: 16
+
+top_k:
+  enabled: false
+  top_k_tokens: 1000
+
+# Training settings for compressor
+compressor_training:
+  pretrain_epochs: 20
+  pretrain_lr: 1.0e-3
+  pretrain_batch_size: 2
+  lambda_recon: 0.1
+  warmup_steps: 100
+
+# Validation settings for 60s video generation
+val_num_latent_frames: 240
+prompt_path: prompts/validation_60s.txt
+num_val_prompts: 2

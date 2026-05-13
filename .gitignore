@@ -3,3 +3,10 @@ __pycache__
 
 wan_models
 checkpoints
+
+# Core dump files
+core.*
+
+# Large data directories
+prompts/
+results/

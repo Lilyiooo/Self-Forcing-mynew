@@ -31,6 +31,35 @@ class DMD(SelfForcingModel):
         # this will be init later with fsdp-wrapped modules
         self.inference_pipeline: SelfForcingTrainingPipeline = None
 
+        # Initialize heterogeneous KV cache components (if enabled)
+        self.heterogeneous_cache_enabled = False
+        self.compressor = None
+        self.density_estimator = None
+        het_cfg = getattr(args, "heterogeneous_cache", None)
+        if het_cfg is not None and getattr(het_cfg, "enabled", False):
+            self.heterogeneous_cache_enabled = True
+            self.het_cache_config = het_cfg
+            from model.density_estimator import DensityEstimator
+            from model.compress import HeterogeneousCompressor
+
+            density_cfg = getattr(args, "density_estimator", None)
+            self.density_estimator = DensityEstimator(
+                high_threshold=getattr(density_cfg, "delta_high", 0.67),
+                low_threshold=getattr(density_cfg, "delta_low", 0.33),
+                motion_weight=getattr(density_cfg, "motion_weight", 0.6),
+                complexity_weight=getattr(density_cfg, "complexity_weight", 0.4),
+            )
+
+            compressor_cfg = getattr(args, "compressor", None)
+            in_ch = getattr(compressor_cfg, "in_ch", 16)
+            d_model = getattr(self.generator.model, 'dim', 1536)
+            self.compressor = HeterogeneousCompressor(
+                vae=self.vae,
+                d_model=d_model,
+                in_ch=in_ch,
+            )
+            print(f"[DMD] Heterogeneous cache enabled: d_model={d_model}, compressor initialized")
+
         # Step 2: Initialize all dmd hyperparameters
         self.num_train_timestep = args.num_train_timestep
         self.min_step = int(0.02 * self.num_train_timestep)
@@ -232,7 +261,32 @@ class DMD(SelfForcingModel):
             denoised_timestep_to=denoised_timestep_to
         )
 
+        # Attach pred_image for compressor recon loss (used by trainer)
+        dmd_log_dict["pred_image"] = pred_image
+
         return dmd_loss, dmd_log_dict
+
+    def _initialize_inference_pipeline(self):
+        """Override to use PackForcingTrainingPipeline when heterogeneous cache is enabled."""
+        if self.heterogeneous_cache_enabled:
+            from pipeline.packforcing_training import PackForcingTrainingPipeline
+            self.inference_pipeline = PackForcingTrainingPipeline(
+                denoising_step_list=self.denoising_step_list,
+                scheduler=self.scheduler,
+                generator=self.generator,
+                compressor=self.compressor,
+                density_estimator=self.density_estimator,
+                het_cache_config=self.het_cache_config,
+                num_frame_per_block=self.num_frame_per_block,
+                independent_first_frame=self.args.independent_first_frame,
+                same_step_across_blocks=self.args.same_step_across_blocks,
+                last_step_only=self.args.last_step_only,
+                num_max_frames=self.num_training_frames,
+                context_noise=self.args.context_noise,
+            )
+            print("[DMD] PackForcingTrainingPipeline initialized")
+        else:
+            super()._initialize_inference_pipeline()
 
     def critic_loss(
         self,
