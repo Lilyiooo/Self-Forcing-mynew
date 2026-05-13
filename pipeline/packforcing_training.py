@@ -128,6 +128,30 @@ class PackForcingTrainingPipeline:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    def _project_compressed_to_kv(self, compressed_tokens):
+        """
+        Project compressed tokens through each transformer layer's k_proj/v_proj
+        to get proper per-layer KV pairs for attention.
+        compressed_tokens: (B, N, D) where D = model_dim
+        Returns: list of (2, B, N, n_heads, head_dim) per layer
+        """
+        B, N, D = compressed_tokens.shape
+        n_heads = self.model_num_heads
+        head_dim = D // n_heads
+
+        kv_compressed_per_layer = []
+        for layer_idx in range(self.num_transformer_blocks):
+            attn = self.generator.model.blocks[layer_idx].self_attn
+            k = attn.norm_k(attn.k(compressed_tokens))  # (B, N, D)
+            v = attn.v(compressed_tokens)                 # (B, N, D)
+            k = k.view(B, N, n_heads, head_dim)
+            v = v.view(B, N, n_heads, head_dim)
+            kv = torch.stack([k, v], dim=0)  # (2, B, N, n_heads, head_dim)
+            kv_compressed_per_layer.append(kv)
+
+        return kv_compressed_per_layer
+
+    @torch.no_grad()
     def _compress_block(self, denoised_pred, chunk_idx, current_start_frame):
         """Compress a finished block and push into mid buffer."""
         if self.het_kv_cache is None or self.compressor is None:
@@ -142,16 +166,8 @@ class PackForcingTrainingPipeline:
         z_compress = z_current.permute(0, 2, 1, 3, 4)
         compressed_tokens, _ = self.compressor(z_compress, density_level)
 
-        # Project to KV format for each transformer layer
-        B, N, D = compressed_tokens.shape
-        n_heads = self.model_num_heads
-        head_dim = D // n_heads
-        tokens_4d = compressed_tokens.view(B, N, n_heads, head_dim)
-
-        kv_compressed_per_layer = []
-        for _ in range(self.num_transformer_blocks):
-            kv = torch.stack([tokens_4d, tokens_4d], dim=0)  # (2, B, N, n_heads, head_dim)
-            kv_compressed_per_layer.append(kv)
+        # Project compressed tokens through each layer's k_proj/v_proj
+        kv_compressed_per_layer = self._project_compressed_to_kv(compressed_tokens)
 
         # Push into mid buffer
         self.het_kv_cache.push_mid_block(
@@ -302,6 +318,7 @@ class PackForcingTrainingPipeline:
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+            clean_denoised = denoised_pred.detach()  # Save clean latent BEFORE adding noise
 
             # Step 3.3: rerun with timestep zero to update the cache
             context_timestep = torch.ones_like(timestep) * self.context_noise
@@ -322,10 +339,10 @@ class PackForcingTrainingPipeline:
                     mid_kv_per_layer=self._get_mid_kv_per_layer(),
                 )
 
-            # Step 3.3a: Compress block and push to mid buffer (NEW)
+            # Step 3.3a: Compress CLEAN latent (not the noised version)
             with torch.no_grad():
                 self._compress_block(
-                    denoised_pred=denoised_pred.detach(),
+                    denoised_pred=clean_denoised,
                     chunk_idx=block_index,
                     current_start_frame=current_start_frame,
                 )
