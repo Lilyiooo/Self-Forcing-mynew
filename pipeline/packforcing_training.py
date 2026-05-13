@@ -130,26 +130,14 @@ class PackForcingTrainingPipeline:
     @torch.no_grad()
     def _project_compressed_to_kv(self, compressed_tokens):
         """
-        Project compressed tokens through each transformer layer's k_proj/v_proj
-        to get proper per-layer KV pairs for attention.
-        compressed_tokens: (B, N, D) where D = model_dim
-        Returns: list of (2, B, N, n_heads, head_dim) per layer
+        Project compressed tokens to KV pairs using compressor's learned projections.
+        Avoids accessing model's FSDP-sharded attention layers directly.
         """
-        B, N, D = compressed_tokens.shape
-        n_heads = self.model_num_heads
-        head_dim = D // n_heads
-
-        kv_compressed_per_layer = []
-        for layer_idx in range(self.num_transformer_blocks):
-            attn = self.generator.model.blocks[layer_idx].self_attn
-            k = attn.norm_k(attn.k(compressed_tokens))  # (B, N, D)
-            v = attn.v(compressed_tokens)                 # (B, N, D)
-            k = k.view(B, N, n_heads, head_dim)
-            v = v.view(B, N, n_heads, head_dim)
-            kv = torch.stack([k, v], dim=0)  # (2, B, N, n_heads, head_dim)
-            kv_compressed_per_layer.append(kv)
-
-        return kv_compressed_per_layer
+        return self.compressor.project_to_kv(
+            compressed_tokens,
+            num_layers=self.num_transformer_blocks,
+            num_heads=self.model_num_heads,
+        )
 
     @torch.no_grad()
     def _compress_block(self, denoised_pred, chunk_idx, current_start_frame):

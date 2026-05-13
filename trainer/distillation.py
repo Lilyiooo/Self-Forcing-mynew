@@ -225,15 +225,16 @@ class Trainer:
 
         # Only train HR heads + decoders (skip LR branch and proj)
         for name, param in self.compressor.named_parameters():
-            if "hr_" in name or "decoder_" in name:
+            if "hr_" in name or "decoder_" in name or "kv_" in name:
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
 
-        # Temporarily cast HR heads + decoders to float32 for stable gradients
+        # Temporarily cast trainable modules to float32 for stable gradients
         pretrain_modules = [
             self.compressor.hr_high, self.compressor.hr_mid, self.compressor.hr_low,
             self.compressor.decoder_high, self.compressor.decoder_mid, self.compressor.decoder_low,
+            self.compressor.kv_k_proj, self.compressor.kv_v_proj,
         ]
         for m in pretrain_modules:
             m.float()
@@ -280,6 +281,17 @@ class Trainer:
                 reconstructed = decoder(compressed, target_shape)      # (B, C, T, H, W)
                 loss = F.mse_loss(reconstructed, z_input)
                 total_loss = total_loss + loss
+
+                # KV projection warmup: ensure kv_k_proj/kv_v_proj produce
+                # non-degenerate output (not all zeros / all same)
+                B_c, N_c, D_c = compressed.shape
+                k_out = self.compressor.kv_k_proj(compressed)
+                v_out = self.compressor.kv_v_proj(compressed)
+                # Regularize: output should have unit variance per feature dim
+                total_loss = total_loss + 0.01 * (
+                    (k_out.var(dim=-1).mean() - 1.0).pow(2)
+                    + (v_out.var(dim=-1).mean() - 1.0).pow(2)
+                )
 
             optimizer.zero_grad()
             total_loss.backward()

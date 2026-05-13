@@ -295,6 +295,12 @@ class HeterogeneousCompressor(nn.Module):
         # HR + LR concat projection to d_model
         self.proj = nn.Linear(d_model * 2, d_model)
 
+        # KV projection heads: project compressed tokens to K and V for attention
+        # Shared across all transformer layers (each layer's attention produces
+        # different queries, so per-layer K/V specialization is not strictly needed)
+        self.kv_k_proj = nn.Linear(d_model, d_model)
+        self.kv_v_proj = nn.Linear(d_model, d_model)
+
         # Validate output token counts with a dummy input
         self._validated = False
 
@@ -348,3 +354,17 @@ class HeterogeneousCompressor(nn.Module):
         combined = torch.cat([hr_tokens, lr_tokens], dim=-1)  # (B, N_hr, 2D)
         out = self.proj(combined)                               # (B, N_hr, D)
         return out, complexity
+
+    def project_to_kv(self, compressed_tokens, num_layers, num_heads):
+        """
+        Project compressed tokens to per-layer KV pairs for attention.
+        Uses learned k_proj and v_proj (shared across layers).
+        compressed_tokens: (B, N, D)
+        Returns: list of (2, B, N, num_heads, head_dim) per layer
+        """
+        B, N, D = compressed_tokens.shape
+        head_dim = D // num_heads
+        k = self.kv_k_proj(compressed_tokens).view(B, N, num_heads, head_dim)
+        v = self.kv_v_proj(compressed_tokens).view(B, N, num_heads, head_dim)
+        kv = torch.stack([k, v], dim=0)  # (2, B, N, num_heads, head_dim)
+        return [kv] * num_layers
