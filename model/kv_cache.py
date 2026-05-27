@@ -20,6 +20,7 @@ class MidBlockMeta:
     density_level: str       # "high", "mid", "low"
     density_score: float     # raw density score
     n_tokens: int            # number of compressed tokens in this block
+    n_frames: int            # number of latent frames represented by this block
     kv_slice: slice          # position in mid_kv_buffer tensor
     temporal_position: int   # absolute frame index when generated (for RoPE adjustment)
 
@@ -43,6 +44,7 @@ class HeterogeneousKVCache:
         Nmid_tokens: int = 5000,   # total token budget for mid buffer
         frame_seq_length: int = 1560,  # tokens per latent frame
         local_attn_size: int = -1,     # local attention window size (-1 = global)
+        eviction_policy: str = "density",
     ):
         self.batch_size = batch_size
         self.num_transformer_blocks = num_transformer_blocks
@@ -55,6 +57,8 @@ class HeterogeneousKVCache:
         self.Nmid_tokens = Nmid_tokens
         self.frame_seq_length = frame_seq_length
         self.local_attn_size = local_attn_size
+        self.eviction_policy = eviction_policy
+        self.rope_delta_frames = 0
 
         # Total KV cache size for recent + sink zones
         if local_attn_size != -1:
@@ -119,6 +123,7 @@ class HeterogeneousKVCache:
         density_level: str,
         density_score: float,
         temporal_position: int = 0,
+        n_frames: int = 0,
     ) -> None:
         """
         Push a new compressed block into the mid buffer.
@@ -133,7 +138,7 @@ class HeterogeneousKVCache:
 
             # Eviction: evict lowest density blocks until enough space
             while self.mid_token_count + N_new > self.Nmid_tokens and self.mid_meta:
-                self._evict_lowest_density_block()
+                self._evict_one_mid_block()
 
             # Truncate if single block exceeds budget
             if N_new > self.Nmid_tokens:
@@ -152,6 +157,7 @@ class HeterogeneousKVCache:
                 density_level=density_level,
                 density_score=density_score,
                 n_tokens=N_new,
+                n_frames=n_frames,
                 kv_slice=slice(start, end),
                 temporal_position=temporal_position,
             ))
@@ -161,7 +167,7 @@ class HeterogeneousKVCache:
             self._ensure_mid_buffers(kv_compressed)
 
             while self.mid_token_count + N_new > self.Nmid_tokens and self.mid_meta:
-                self._evict_lowest_density_block()
+                self._evict_one_mid_block()
 
             if N_new > self.Nmid_tokens:
                 kv_compressed = kv_compressed[:, :, :self.Nmid_tokens, :, :]
@@ -177,6 +183,7 @@ class HeterogeneousKVCache:
                 density_level=density_level,
                 density_score=density_score,
                 n_tokens=N_new,
+                n_frames=n_frames,
                 kv_slice=slice(start, end),
                 temporal_position=temporal_position,
             ))
@@ -184,16 +191,32 @@ class HeterogeneousKVCache:
         assert self.mid_token_count <= self.Nmid_tokens, \
             f"mid buffer overflow: {self.mid_token_count} > {self.Nmid_tokens}"
 
+    def _evict_one_mid_block(self) -> None:
+        if self.eviction_policy == "fifo":
+            self._evict_mid_block(0)
+        elif self.eviction_policy == "density":
+            min_idx = min(range(len(self.mid_meta)), key=lambda i: self.mid_meta[i].density_score)
+            self._evict_mid_block(min_idx)
+        else:
+            raise ValueError(f"unknown eviction_policy: {self.eviction_policy}")
+
     def _evict_lowest_density_block(self) -> None:
         """Evict the block with the lowest density_score (in-place compaction)."""
         if not self.mid_meta:
             return
-
-        # Find the block with minimum density_score
         min_idx = min(range(len(self.mid_meta)), key=lambda i: self.mid_meta[i].density_score)
-        evicted = self.mid_meta.pop(min_idx)
+        self._evict_mid_block(min_idx)
+
+    def _evict_mid_block(self, evict_idx: int) -> None:
+        """Evict one mid block by index (in-place compaction)."""
+        if not self.mid_meta:
+            return
+
+        evicted = self.mid_meta.pop(evict_idx)
         ev_slice = evicted.kv_slice
         ev_n = evicted.n_tokens
+        if self.eviction_policy == "fifo":
+            self.rope_delta_frames += evicted.n_frames
 
         # In-place move: shift tokens after ev_slice forward
         end = self.mid_token_count
@@ -226,6 +249,7 @@ class HeterogeneousKVCache:
         """Reset mid buffer at the start of each video generation."""
         self.mid_meta = []
         self.mid_token_count = 0
+        self.rope_delta_frames = 0
         # Don't zero mid_kv_buffers tensors; next writes will overwrite
 
     # ------------------------------------------------------------------

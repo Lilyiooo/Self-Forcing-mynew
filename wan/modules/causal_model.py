@@ -228,16 +228,23 @@ class CausalWanSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
-            # Build the key/value tensors for attention: [sink | mid_compressed | recent]
-            attn_k = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            attn_v = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            # Build the key/value tensors for attention as [sink | mid | recent].
+            full_k = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            full_v = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            sink_len = min(sink_tokens, full_k.shape[1])
+            sink_k = full_k[:, :sink_len]
+            sink_v = full_v[:, :sink_len]
+            recent_k = full_k[:, sink_len:]
+            recent_v = full_v[:, sink_len:]
 
-            # Inject mid buffer compressed KV if available
             if mid_kv is not None:
                 mid_k = mid_kv[0]  # (B, N_mid, n_heads, head_dim)
                 mid_v = mid_kv[1]  # (B, N_mid, n_heads, head_dim)
-                attn_k = torch.cat([attn_k, mid_k], dim=1)
-                attn_v = torch.cat([attn_v, mid_v], dim=1)
+                attn_k = torch.cat([sink_k, mid_k, recent_k], dim=1)
+                attn_v = torch.cat([sink_v, mid_v, recent_v], dim=1)
+            else:
+                attn_k = torch.cat([sink_k, recent_k], dim=1)
+                attn_v = torch.cat([sink_v, recent_v], dim=1)
 
             x = attention(
                 roped_query,

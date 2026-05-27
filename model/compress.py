@@ -304,6 +304,17 @@ class HeterogeneousCompressor(nn.Module):
         # Validate output token counts with a dummy input
         self._validated = False
 
+    def compressed_grid_shape(self, density_level: DensityLevel, latent_shape: tuple[int, int, int]) -> tuple[int, int, int]:
+        """Return the HR-branch compressed token grid for (T, H, W)."""
+        T, H, W = latent_shape
+        t = (T - 1) // 2 + 1
+        spatial_layers = {"high": 1, "mid": 3, "low": 4}[density_level]
+        h, w = H, W
+        for _ in range(spatial_layers):
+            h = (h - 1) // 2 + 1
+            w = (w - 1) // 2 + 1
+        return t, h, w
+
     def _validate_heads(self, in_ch: int, device: torch.device):
         """Validate HR head output shapes with a dummy input."""
         # Wan2.1-T2V-1.3B latent: C=16, T varies (1 or num_frame_per_block), H=60, W=104

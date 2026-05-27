@@ -2,6 +2,7 @@ from typing import List, Optional
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.rope_utils import apply_temporal_rope_shift, apply_temporal_rope_to_unrotated
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 
@@ -86,6 +87,7 @@ class CausalInferencePipeline(torch.nn.Module):
             self.compressor = None
             self.het_kv_cache = None
             self._recent_clean_blocks = []
+            self._applied_rope_delta_frames = 0
 
     def load_compressor_state_dict(self, state_dict, device=None, dtype=None, strict=True):
         """Load trained heterogeneous compressor weights for validation/inference."""
@@ -436,11 +438,13 @@ class CausalInferencePipeline(torch.nn.Module):
             Nmid_tokens=getattr(het_cfg, "Nmid_tokens", 5000),
             frame_seq_length=self.frame_seq_length,
             local_attn_size=effective_window,
+            eviction_policy=getattr(het_cfg, "eviction_policy", "density"),
         )
 
         # Reset density estimator
         self.density_estimator.reset_stats()
         self._recent_clean_blocks = []
+        self._applied_rope_delta_frames = 0
 
         # Set up the old-style caches as aliases for backward compatibility
         self.kv_cache1 = [self.het_kv_cache.get_layer_cache(i) for i in range(self.num_transformer_blocks)]
@@ -486,6 +490,46 @@ class CausalInferencePipeline(torch.nn.Module):
             num_heads=self.model_num_heads,
         )
 
+    def _apply_mid_temporal_rope(self, kv_compressed_per_layer, density_level, latent_shape, current_start_frame):
+        """Apply initial temporal RoPE to compressed mid keys before caching."""
+        grid_shape = self.compressor.compressed_grid_shape(density_level, latent_shape)
+        freqs = self.generator.model.freqs
+        roped = []
+        for kv in kv_compressed_per_layer:
+            k = apply_temporal_rope_to_unrotated(
+                kv[0],
+                freqs=freqs,
+                start_frame=current_start_frame,
+                grid_shape=grid_shape,
+                temporal_stride=2,
+            )
+            roped.append(torch.stack([k, kv[1]], dim=0))
+        return roped
+
+    def _apply_sink_rope_correction_if_needed(self):
+        """Apply FIFO eviction's temporal shift to already-roped sink keys."""
+        if self.het_kv_cache is None:
+            return
+
+        total_delta = getattr(self.het_kv_cache, "rope_delta_frames", 0)
+        delta = total_delta - self._applied_rope_delta_frames
+        if delta <= 0:
+            return
+
+        sink_tokens = getattr(self.het_cache_config, "Nsink", 8) * self.frame_seq_length
+        freqs = self.generator.model.freqs
+        for layer_cache in self.kv_cache1:
+            local_end = layer_cache["local_end_index"].item()
+            n_sink = min(sink_tokens, local_end)
+            if n_sink == 0:
+                continue
+            layer_cache["k"][:, :n_sink] = apply_temporal_rope_shift(
+                layer_cache["k"][:, :n_sink],
+                freqs=freqs,
+                delta=delta,
+            )
+        self._applied_rope_delta_frames = total_delta
+
     @torch.no_grad()
     def _maybe_compress_block(self, denoised_pred, chunk_idx, current_start_frame, z_prev_chunk):
         """
@@ -507,6 +551,12 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Project compressed tokens through each layer's k_proj/v_proj
         kv_compressed_per_layer = self._project_compressed_to_kv(compressed_tokens)
+        kv_compressed_per_layer = self._apply_mid_temporal_rope(
+            kv_compressed_per_layer,
+            density_level=density_level,
+            latent_shape=z_compress.shape[2:],
+            current_start_frame=current_start_frame,
+        )
 
         # Push into mid buffer
         self.het_kv_cache.push_mid_block(
@@ -514,7 +564,9 @@ class CausalInferencePipeline(torch.nn.Module):
             density_level=density_level,
             density_score=density_score,
             temporal_position=current_start_frame,
+            n_frames=denoised_pred.shape[1],
         )
+        self._apply_sink_rope_correction_if_needed()
 
         B, N, D = compressed_tokens.shape
         print(f"  [HetCache] chunk {chunk_idx}: density={density_score:.3f} ({density_level}), "

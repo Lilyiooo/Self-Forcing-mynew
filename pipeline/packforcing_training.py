@@ -14,6 +14,7 @@ from utils.scheduler import SchedulerInterface
 from typing import List, Optional
 import torch
 import torch.distributed as dist
+from utils.rope_utils import apply_temporal_rope_shift, apply_temporal_rope_to_unrotated
 
 
 class PackForcingTrainingPipeline:
@@ -83,6 +84,7 @@ class PackForcingTrainingPipeline:
         # attention back to compressor parameters.
         self._diff_mid_kv_list: List[torch.Tensor] = []
         self._diff_mode: bool = False
+        self._applied_rope_delta_frames = 0
 
     # ------------------------------------------------------------------
     # Cache initialization (three-zone heterogeneous cache)
@@ -112,11 +114,13 @@ class PackForcingTrainingPipeline:
             Nmid_tokens=self.Nmid_tokens,
             frame_seq_length=self.frame_seq_length,
             local_attn_size=self.effective_window,
+            eviction_policy=getattr(self.het_cache_config, "eviction_policy", "density"),
         )
 
         # Reset density estimator for each new video
         self.density_estimator.reset()
         self._recent_clean_blocks = []
+        self._applied_rope_delta_frames = 0
 
         # Set up backward-compatible aliases
         self.kv_cache1 = [self.het_kv_cache.get_layer_cache(i) for i in range(self.num_transformer_blocks)]
@@ -158,6 +162,46 @@ class PackForcingTrainingPipeline:
             num_heads=self.model_num_heads,
         )
 
+    def _apply_mid_temporal_rope(self, kv_compressed_per_layer, density_level, latent_shape, current_start_frame):
+        """Apply initial temporal RoPE to compressed mid keys before caching."""
+        grid_shape = self.compressor.compressed_grid_shape(density_level, latent_shape)
+        freqs = self.generator.model.freqs
+        roped = []
+        for kv in kv_compressed_per_layer:
+            k = apply_temporal_rope_to_unrotated(
+                kv[0],
+                freqs=freqs,
+                start_frame=current_start_frame,
+                grid_shape=grid_shape,
+                temporal_stride=2,
+            )
+            roped.append(torch.stack([k, kv[1]], dim=0))
+        return roped
+
+    def _apply_sink_rope_correction_if_needed(self):
+        """Apply FIFO eviction's temporal shift to already-roped sink keys."""
+        if self.het_kv_cache is None:
+            return
+
+        total_delta = getattr(self.het_kv_cache, "rope_delta_frames", 0)
+        delta = total_delta - self._applied_rope_delta_frames
+        if delta <= 0:
+            return
+
+        sink_tokens = self.Nsink * self.frame_seq_length
+        freqs = self.generator.model.freqs
+        for layer_cache in self.kv_cache1:
+            local_end = layer_cache["local_end_index"].item()
+            n_sink = min(sink_tokens, local_end)
+            if n_sink == 0:
+                continue
+            layer_cache["k"][:, :n_sink] = apply_temporal_rope_shift(
+                layer_cache["k"][:, :n_sink],
+                freqs=freqs,
+                delta=delta,
+            )
+        self._applied_rope_delta_frames = total_delta
+
     @torch.no_grad()
     def _compress_block(self, denoised_pred, chunk_idx, current_start_frame):
         """Compress a finished block and push into mid buffer (no gradient)."""
@@ -175,6 +219,12 @@ class PackForcingTrainingPipeline:
 
         # Project compressed tokens through each layer's k_proj/v_proj
         kv_compressed_per_layer = self._project_compressed_to_kv(compressed_tokens)
+        kv_compressed_per_layer = self._apply_mid_temporal_rope(
+            kv_compressed_per_layer,
+            density_level=density_level,
+            latent_shape=z_compress.shape[2:],
+            current_start_frame=current_start_frame,
+        )
 
         # Push into mid buffer
         self.het_kv_cache.push_mid_block(
@@ -182,7 +232,9 @@ class PackForcingTrainingPipeline:
             density_level=density_level,
             density_score=density_score,
             temporal_position=current_start_frame,
+            n_frames=denoised_pred.shape[1],
         )
+        self._apply_sink_rope_correction_if_needed()
 
     def _compress_block_differentiable(self, denoised_pred, chunk_idx, current_start_frame):
         """
@@ -209,6 +261,12 @@ class PackForcingTrainingPipeline:
             compressed_tokens,
             num_layers=self.num_transformer_blocks,
             num_heads=self.model_num_heads,
+        )
+        kv_compressed = self._apply_mid_temporal_rope(
+            kv_compressed,
+            density_level=density_level,
+            latent_shape=z_compress.shape[2:],
+            current_start_frame=current_start_frame,
         )
 
         # Store in list (differentiable via torch.cat in _get_mid_kv_per_layer)

@@ -62,6 +62,7 @@ heterogeneous_cache:
   Nsink: 8              # sink partition size (latent frames)
   Nrecent: 4            # recent window size (latent frames)
   Nmid_tokens: 5000     # mid buffer total token budget
+  eviction_policy: fifo # fifo is required for incremental RoPE correction
 
 density_estimator:
   delta_high: 0.7

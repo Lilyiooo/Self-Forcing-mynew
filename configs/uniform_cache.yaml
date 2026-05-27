@@ -63,6 +63,7 @@ heterogeneous_cache:
   Nsink: 8
   Nrecent: 4
   Nmid_tokens: 5000
+  eviction_policy: fifo
 
 # Clamp thresholds so ALL blocks are classified as "mid" → always use 32x compression
 density_estimator:
