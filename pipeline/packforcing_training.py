@@ -3,6 +3,10 @@ packforcing_training.py — PackForcing training pipeline with heterogeneous KV 
 
 Mirrors SelfForcingTrainingPipeline but uses three-zone cache (sink/mid/recent)
 with compression during training, ensuring train-test consistency.
+
+Supports end-to-end differentiable compression: when gradients are enabled,
+compressed KV tensors are accumulated in a list (not in-place buffers) so that
+DMD loss gradients flow through attention back to the compressor parameters.
 """
 
 from utils.wan_wrapper import WanDiffusionWrapper
@@ -72,6 +76,13 @@ class PackForcingTrainingPipeline:
         self.crossattn_cache = None
         self.het_kv_cache = None
 
+        # End-to-end differentiable mid KV storage
+        # When grad is enabled, compressed KV tensors are stored here instead of
+        # in-place buffer writes, allowing gradients to flow from DMD loss through
+        # attention back to compressor parameters.
+        self._diff_mid_kv_list: List[torch.Tensor] = []
+        self._diff_mode: bool = False
+
     # ------------------------------------------------------------------
     # Cache initialization (three-zone heterogeneous cache)
     # ------------------------------------------------------------------
@@ -118,7 +129,13 @@ class PackForcingTrainingPipeline:
     # ------------------------------------------------------------------
 
     def _get_mid_kv_per_layer(self):
-        """Build per-layer mid_kv list from heterogeneous cache."""
+        """Build per-layer mid_kv list from differentiable list or heterogeneous cache."""
+        if self._diff_mode and self._diff_mid_kv_list:
+            # Differentiable path: concatenate all compressed KV tensors.
+            # torch.cat preserves gradient chain back to compressor parameters.
+            combined_kv = torch.cat(self._diff_mid_kv_list, dim=2)  # (2, B, total_N, heads, head_dim)
+            return [combined_kv] * self.num_transformer_blocks
+        # Fallback: use in-place cache buffer (inference or no mid tokens)
         if self.het_kv_cache is None:
             return [None] * self.num_transformer_blocks
         return [self.het_kv_cache.get_mid_kv(i) for i in range(self.num_transformer_blocks)]
@@ -141,7 +158,7 @@ class PackForcingTrainingPipeline:
 
     @torch.no_grad()
     def _compress_block(self, denoised_pred, chunk_idx, current_start_frame):
-        """Compress a finished block and push into mid buffer."""
+        """Compress a finished block and push into mid buffer (no gradient)."""
         if self.het_kv_cache is None or self.compressor is None:
             return
 
@@ -164,6 +181,36 @@ class PackForcingTrainingPipeline:
             density_score=density_score,
             temporal_position=current_start_frame,
         )
+
+    def _compress_block_differentiable(self, denoised_pred, chunk_idx, current_start_frame):
+        """
+        Differentiable compression — keeps gradient chain alive so DMD loss gradients
+        can flow through attention back to compressor Conv3D / projection parameters.
+
+        Stores compressed KV in _diff_mid_kv_list (not in-place buffer).
+        """
+        if self.compressor is None:
+            return
+
+        z_current = denoised_pred  # NOT detached — gradient flows through
+
+        # Density estimation (routing only, no learnable parameters)
+        with torch.no_grad():
+            density_level, density_score, density_info = self.density_estimator(z_current)
+
+        # Compress WITH gradient — HR branch Conv3D is fully differentiable
+        z_compress = z_current.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+        compressed_tokens, _ = self.compressor(z_compress, density_level)
+
+        # Project to KV WITH gradient — kv_k_proj / kv_v_proj are learnable
+        kv_compressed = self.compressor.project_to_kv(
+            compressed_tokens,
+            num_layers=self.num_transformer_blocks,
+            num_heads=self.model_num_heads,
+        )
+
+        # Store in list (differentiable via torch.cat in _get_mid_kv_per_layer)
+        self._diff_mid_kv_list.append(kv_compressed[0])  # (2, B, N, heads, head_dim)
 
     # ------------------------------------------------------------------
     # Random index sync (same as SelfForcingTrainingPipeline)
@@ -201,6 +248,10 @@ class PackForcingTrainingPipeline:
         """
         Same as SelfForcingTrainingPipeline.inference_with_trajectory() but
         uses three-zone heterogeneous KV cache with compression.
+
+        When torch.is_grad_enabled(), compression is differentiable: compressed KV
+        tensors are stored in a list and concatenated via torch.cat, preserving the
+        gradient chain from DMD loss through attention back to compressor parameters.
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
@@ -216,6 +267,10 @@ class PackForcingTrainingPipeline:
             device=noise.device,
             dtype=noise.dtype
         )
+
+        # Step 0: Set up differentiable compression mode
+        self._diff_mode = torch.is_grad_enabled()
+        self._diff_mid_kv_list = []
 
         # Step 1: Initialize heterogeneous KV cache
         self._initialize_kv_cache(
@@ -250,6 +305,7 @@ class PackForcingTrainingPipeline:
         for block_index, current_num_frames in enumerate(all_num_frames):
             noisy_input = noise[
                 :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+            is_gradient_block = current_start_frame >= start_gradient_frame_index
 
             # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
@@ -281,7 +337,7 @@ class PackForcingTrainingPipeline:
                                 [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
                         ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    if current_start_frame < start_gradient_frame_index:
+                    if not is_gradient_block:
                         with torch.no_grad():
                             _, denoised_pred = self.generator(
                                 noisy_image_or_video=noisy_input,
@@ -306,7 +362,6 @@ class PackForcingTrainingPipeline:
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
-            clean_denoised = denoised_pred.detach()  # Save clean latent BEFORE adding noise
 
             # Step 3.3: rerun with timestep zero to update the cache
             context_timestep = torch.ones_like(timestep) * self.context_noise
@@ -327,13 +382,32 @@ class PackForcingTrainingPipeline:
                     mid_kv_per_layer=self._get_mid_kv_per_layer(),
                 )
 
-            # Step 3.3a: Compress CLEAN latent (not the noised version)
-            with torch.no_grad():
+            # Step 3.3a: Compress CLEAN latent
+            if is_gradient_block and self._diff_mode:
+                # End-to-end path: keep gradient alive for DMD loss backprop
+                # denoised_pred has been re-noised, use output slice (clean denoised)
+                clean_denoised = output[:, current_start_frame:current_start_frame + current_num_frames]
+                self._compress_block_differentiable(
+                    denoised_pred=clean_denoised,
+                    chunk_idx=block_index,
+                    current_start_frame=current_start_frame,
+                )
+            else:
+                # No-gradient path: original in-place cache write
+                clean_denoised = output[:, current_start_frame:current_start_frame + current_num_frames].detach()
                 self._compress_block(
                     denoised_pred=clean_denoised,
                     chunk_idx=block_index,
                     current_start_frame=current_start_frame,
                 )
+                # For diff_mode, also store a detached copy in the list so
+                # _get_mid_kv_per_layer returns consistent mid_kv across all blocks
+                if self._diff_mode:
+                    self._compress_block_differentiable(
+                        denoised_pred=clean_denoised.detach(),
+                        chunk_idx=block_index,
+                        current_start_frame=current_start_frame,
+                    )
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames

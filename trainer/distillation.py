@@ -175,6 +175,16 @@ class Trainer:
                 state_dict, strict=True
             )
 
+        # Load compressor checkpoint (for end-to-end training resume)
+        if getattr(config, "compressor_ckpt", False):
+            print(f"Loading compressor checkpoint from {config.compressor_ckpt}")
+            ckpt = torch.load(config.compressor_ckpt, map_location="cpu")
+            compressor_sd = ckpt.get("compressor", ckpt)
+            # Will be loaded after compressor is initialized (step 8)
+            self._pending_compressor_sd = compressor_sd
+        else:
+            self._pending_compressor_sd = None
+
         ##############################################################################################################
 
         # Let's delete EMA params for early steps to save some computes at training and inference
@@ -195,13 +205,38 @@ class Trainer:
                 self.compressor = self.compressor.to(device=self.device, dtype=self.dtype)
 
             compressor_train_cfg = getattr(config, "compressor_training", None)
-            self.lambda_recon = getattr(compressor_train_cfg, "lambda_recon", 0.1) if compressor_train_cfg else 0.1
+            self.lambda_recon = getattr(compressor_train_cfg, "lambda_recon", 0.01) if compressor_train_cfg else 0.01
             self.recon_warmup_steps = getattr(compressor_train_cfg, "warmup_steps", 100) if compressor_train_cfg else 100
 
+            # End-to-end compressor training: separate optimizer with its own LR
+            self.end_to_end_compressor = getattr(compressor_train_cfg, "end_to_end", False) if compressor_train_cfg else False
+            if self.end_to_end_compressor and self.compressor is not None:
+                compressor_lr = getattr(compressor_train_cfg, "compressor_lr", 1e-4)
+                self.compressor_optimizer = torch.optim.AdamW(
+                    [p for p in self.compressor.parameters() if p.requires_grad],
+                    lr=compressor_lr,
+                    betas=(0.0, 0.999),
+                    weight_decay=0.01,
+                )
+                self.compressor_grad_clip = getattr(compressor_train_cfg, "compressor_grad_clip", 1.0)
+                print(f"End-to-end compressor training enabled: lr={compressor_lr}, "
+                      f"grad_clip={self.compressor_grad_clip}")
+            else:
+                self.compressor_optimizer = None
+                self.compressor_grad_clip = 1.0
+
             print(f"Heterogeneous cache training enabled: lambda_recon={self.lambda_recon}, "
-                  f"warmup_steps={self.recon_warmup_steps}")
+                  f"warmup_steps={self.recon_warmup_steps}, end_to_end={self.end_to_end_compressor}")
         else:
             self.compressor = None
+            self.compressor_optimizer = None
+            self.end_to_end_compressor = False
+
+        # Load compressor state dict from checkpoint (after initialization)
+        if self._pending_compressor_sd is not None and self.compressor is not None:
+            self.compressor.load_state_dict(self._pending_compressor_sd, strict=True)
+            print("Compressor checkpoint loaded successfully.")
+            self._pending_compressor_sd = None
 
     def pretrain_compressor(self, num_steps=100):
         """
@@ -350,8 +385,6 @@ class Trainer:
 
         return total_loss
 
-        return total_loss
-
     def save(self):
         print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(
@@ -370,6 +403,10 @@ class Trainer:
                 "generator": generator_state_dict,
                 "critic": critic_state_dict,
             }
+
+        # Save compressor state dict for end-to-end training
+        if self.compressor is not None:
+            state_dict["compressor"] = self.compressor.state_dict()
 
         if self.is_main_process:
             os.makedirs(os.path.join(self.output_path,
@@ -415,6 +452,10 @@ class Trainer:
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
+            # Zero compressor gradients before forward (end-to-end path)
+            if self.compressor_optimizer is not None:
+                self.compressor_optimizer.zero_grad(set_to_none=True)
+
             generator_loss, generator_log_dict = self.model.generator_loss(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
@@ -443,6 +484,16 @@ class Trainer:
             total_loss.backward()
             generator_grad_norm = self.model.generator.clip_grad_norm_(
                 self.max_grad_norm_generator)
+
+            # Step compressor optimizer (end-to-end gradient from DMD loss
+            # flows through attention → compressed KV → compressor parameters)
+            if self.compressor_optimizer is not None:
+                compressor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.compressor.parameters() if p.requires_grad],
+                    self.compressor_grad_clip,
+                )
+                self.compressor_optimizer.step()
+                generator_log_dict["compressor_grad_norm"] = compressor_grad_norm
 
             generator_log_dict.update({"generator_loss": total_loss,
                                        "generator_grad_norm": generator_grad_norm})
@@ -662,6 +713,8 @@ class Trainer:
                     if "recon_loss" in generator_log_dict:
                         wandb_loss_dict["recon_loss"] = generator_log_dict["recon_loss"].mean().item()
                         wandb_loss_dict["effective_lambda"] = generator_log_dict["effective_lambda"]
+                    if "compressor_grad_norm" in generator_log_dict:
+                        wandb_loss_dict["compressor_grad_norm"] = generator_log_dict["compressor_grad_norm"].mean().item()
 
                 wandb_loss_dict.update(
                     {

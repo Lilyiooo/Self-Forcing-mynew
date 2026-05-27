@@ -82,10 +82,10 @@ compressor_training:
   pretrain_epochs: 20     # number of epochs for HR head pretraining (steps = epochs * 20)
   pretrain_lr: 1.0e-3     # 1e-3 for visible convergence in limited steps
   pretrain_batch_size: 2  # batch size for random latent pretrain
-  end_to_end: false        # enable DMD gradient flow through attention to compressor
+  end_to_end: true        # enable DMD gradient flow through attention to compressor
   compressor_lr: 1.0e-4   # separate learning rate for end-to-end compressor optimization
   compressor_grad_clip: 1.0  # gradient clipping for compressor parameters
-  lambda_recon: 0.1      # reduced reconstruction auxiliary loss (DMD is primary signal now)
+  lambda_recon: 0.01      # reduced reconstruction auxiliary loss (DMD is primary signal now)
   warmup_steps: 100       # steps to warm up lambda_recon from 0
 
 # Validation settings for 60s video generation
