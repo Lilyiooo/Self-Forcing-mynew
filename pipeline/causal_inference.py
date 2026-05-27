@@ -2,6 +2,7 @@ from typing import List, Optional
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.cache_lifecycle import queue_aged_blocks
 from utils.rope_utils import apply_temporal_rope_shift, apply_temporal_rope_to_unrotated
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
@@ -593,19 +594,16 @@ class CausalInferencePipeline(torch.nn.Module):
 
         Nsink = getattr(self.het_cache_config, "Nsink", 8)
         Nrecent = getattr(self.het_cache_config, "Nrecent", 4)
-        self._recent_clean_blocks.append({
-            "latent": clean_block,
-            "chunk_idx": chunk_idx,
-            "start": current_start_frame,
-            "end": current_start_frame + clean_block.shape[1],
-            "prev": z_prev_chunk,
-        })
-        cutoff_frame = current_start_frame + clean_block.shape[1] - Nrecent
-
-        while self._recent_clean_blocks and self._recent_clean_blocks[0]["end"] <= cutoff_frame:
-            block = self._recent_clean_blocks.pop(0)
-            if block["start"] < Nsink:
-                continue
+        aged_blocks = queue_aged_blocks(
+            self._recent_clean_blocks,
+            clean_block=clean_block,
+            chunk_idx=chunk_idx,
+            current_start_frame=current_start_frame,
+            nsink=Nsink,
+            nrecent=Nrecent,
+            extra={"prev": z_prev_chunk},
+        )
+        for block in aged_blocks:
             self._maybe_compress_block(
                 denoised_pred=block["latent"],
                 chunk_idx=block["chunk_idx"],

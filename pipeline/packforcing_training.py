@@ -14,6 +14,7 @@ from utils.scheduler import SchedulerInterface
 from typing import List, Optional
 import torch
 import torch.distributed as dist
+from utils.cache_lifecycle import queue_aged_blocks
 from utils.rope_utils import apply_temporal_rope_shift, apply_temporal_rope_to_unrotated
 
 
@@ -274,19 +275,15 @@ class PackForcingTrainingPipeline:
 
     def _queue_clean_block_for_compression(self, clean_block, chunk_idx, current_start_frame):
         """Compress only blocks that have aged out of the recent window."""
-        self._recent_clean_blocks.append({
-            "latent": clean_block,
-            "chunk_idx": chunk_idx,
-            "start": current_start_frame,
-            "end": current_start_frame + clean_block.shape[1],
-        })
-        cutoff_frame = current_start_frame + clean_block.shape[1] - self.Nrecent
-
-        while self._recent_clean_blocks and self._recent_clean_blocks[0]["end"] <= cutoff_frame:
-            block = self._recent_clean_blocks.pop(0)
-            if block["start"] < self.Nsink:
-                continue
-
+        aged_blocks = queue_aged_blocks(
+            self._recent_clean_blocks,
+            clean_block=clean_block,
+            chunk_idx=chunk_idx,
+            current_start_frame=current_start_frame,
+            nsink=self.Nsink,
+            nrecent=self.Nrecent,
+        )
+        for block in aged_blocks:
             if self._diff_mode and block["latent"].requires_grad:
                 self._compress_block_differentiable(
                     denoised_pred=block["latent"],
