@@ -19,6 +19,7 @@ class CausalInferencePipeline(torch.nn.Module):
             vae=None
     ):
         super().__init__()
+        self.device = device
         # Lazy imports to avoid circular dependency (pipeline ↔ model.base)
         from model.density_estimator import DensityEstimator
         from model.compress import HeterogeneousCompressor
@@ -84,6 +85,26 @@ class CausalInferencePipeline(torch.nn.Module):
             # Compressor (will be initialized lazily on first device placement)
             self.compressor = None
             self.het_kv_cache = None
+            self._recent_clean_blocks = []
+
+    def load_compressor_state_dict(self, state_dict, device=None, dtype=None, strict=True):
+        """Load trained heterogeneous compressor weights for validation/inference."""
+        if not self.heterogeneous_cache_enabled:
+            return False
+
+        if self.compressor is None:
+            compressor_cfg = getattr(self.args, "compressor", None)
+            in_ch = getattr(compressor_cfg, "in_ch", 16)
+            self.compressor = self._HeterogeneousCompressor(
+                vae=self.vae,
+                d_model=self.model_dim,
+                in_ch=in_ch,
+            )
+
+        if device is not None or dtype is not None:
+            self.compressor = self.compressor.to(device=device, dtype=dtype)
+        self.compressor.load_state_dict(state_dict, strict=strict)
+        return True
 
     def inference(
         self,
@@ -275,10 +296,11 @@ class CausalInferencePipeline(torch.nn.Module):
                 current_start_frame=current_start_frame,
             )
 
-            # Step 3.3a: Heterogeneous cache - compress CLEAN latent (not noised)
+            # Step 3.3a: Heterogeneous cache - queue CLEAN latent and compress
+            # only after it leaves the full-resolution recent window.
             if self.heterogeneous_cache_enabled:
-                self._maybe_compress_block(
-                    denoised_pred=clean_denoised,
+                self._queue_clean_block_for_compression(
+                    clean_block=clean_denoised,
                     chunk_idx=chunk_idx,
                     current_start_frame=current_start_frame,
                     z_prev_chunk=z_prev_chunk,
@@ -398,6 +420,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 d_model=d_model,
                 in_ch=in_ch,
             ).to(device=device, dtype=dtype)
+        else:
+            self.compressor = self.compressor.to(device=device, dtype=dtype)
 
         # Initialize the heterogeneous KV cache
         self.het_kv_cache = self._HeterogeneousKVCache(
@@ -416,6 +440,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Reset density estimator
         self.density_estimator.reset_stats()
+        self._recent_clean_blocks = []
 
         # Set up the old-style caches as aliases for backward compatibility
         self.kv_cache1 = [self.het_kv_cache.get_layer_cache(i) for i in range(self.num_transformer_blocks)]
@@ -472,12 +497,12 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Current chunk latent (for density estimation)
         z_current = denoised_pred  # (B, T, C, H, W)
+        z_compress = z_current.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
 
         # Estimate density (v2: single call, no dependency on z_prev or LR complexity)
-        density_level, density_score, density_info = self.density_estimator(z_current)
+        density_level, density_score, density_info = self.density_estimator(z_compress)
 
         # Compress: need latent in (B, C, T, H, W) format for compressor
-        z_compress = z_current.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
         compressed_tokens, _complexity_from_lr = self.compressor(z_compress, density_level)
 
         # Project compressed tokens through each layer's k_proj/v_proj
@@ -497,16 +522,41 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Optional density logging (used by experiment_A_density_vis)
         if hasattr(self, '_density_log') and self._density_log is not None:
-            # Optional density logging (used by experiment_A_density_vis)
-            if hasattr(self, '_density_log') and self._density_log is not None:
-                self._density_log.append({
-                    "block_idx": int(chunk_idx),
-                    "time_sec": float(chunk_idx * self.num_frame_per_block * 4 / 16.0),
-                    "motion_score": density_info["raw_motion"],
-                    "complexity_score": density_info["raw_complexity"],
-                    "norm_motion": density_info["norm_motion"],
-                    "norm_complexity": density_info["norm_complexity"],
-                    "density_score": float(density_score),
-                    "tier": density_level,
-                    "tokens_allocated": int(N),
-                })
+            self._density_log.append({
+                "block_idx": int(chunk_idx),
+                "time_sec": float(chunk_idx * self.num_frame_per_block * 4 / 16.0),
+                "motion_score": density_info["raw_motion"],
+                "complexity_score": density_info["raw_complexity"],
+                "norm_motion": density_info["norm_motion"],
+                "norm_complexity": density_info["norm_complexity"],
+                "density_score": float(density_score),
+                "tier": density_level,
+                "tokens_allocated": int(N),
+            })
+
+    def _queue_clean_block_for_compression(self, clean_block, chunk_idx, current_start_frame, z_prev_chunk=None):
+        """Keep sink/recent full-res; compress only aged historical blocks."""
+        if self.het_kv_cache is None or self.compressor is None:
+            return
+
+        Nsink = getattr(self.het_cache_config, "Nsink", 8)
+        Nrecent = getattr(self.het_cache_config, "Nrecent", 4)
+        self._recent_clean_blocks.append({
+            "latent": clean_block,
+            "chunk_idx": chunk_idx,
+            "start": current_start_frame,
+            "end": current_start_frame + clean_block.shape[1],
+            "prev": z_prev_chunk,
+        })
+        cutoff_frame = current_start_frame + clean_block.shape[1] - Nrecent
+
+        while self._recent_clean_blocks and self._recent_clean_blocks[0]["end"] <= cutoff_frame:
+            block = self._recent_clean_blocks.pop(0)
+            if block["start"] < Nsink:
+                continue
+            self._maybe_compress_block(
+                denoised_pred=block["latent"],
+                chunk_idx=block["chunk_idx"],
+                current_start_frame=block["start"],
+                z_prev_chunk=block["prev"],
+            )

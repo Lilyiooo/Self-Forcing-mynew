@@ -75,6 +75,7 @@ class PackForcingTrainingPipeline:
         self.kv_cache1 = None
         self.crossattn_cache = None
         self.het_kv_cache = None
+        self._recent_clean_blocks = []
 
         # End-to-end differentiable mid KV storage
         # When grad is enabled, compressed KV tensors are stored here instead of
@@ -115,6 +116,7 @@ class PackForcingTrainingPipeline:
 
         # Reset density estimator for each new video
         self.density_estimator.reset()
+        self._recent_clean_blocks = []
 
         # Set up backward-compatible aliases
         self.kv_cache1 = [self.het_kv_cache.get_layer_cache(i) for i in range(self.num_transformer_blocks)]
@@ -163,12 +165,12 @@ class PackForcingTrainingPipeline:
             return
 
         z_current = denoised_pred  # (B, T, C, H, W)
+        z_compress = z_current.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
 
         # Estimate density
-        density_level, density_score, density_info = self.density_estimator(z_current)
+        density_level, density_score, density_info = self.density_estimator(z_compress)
 
-        # Compress: need (B, C, T, H, W) format
-        z_compress = z_current.permute(0, 2, 1, 3, 4)
+        # Compress in (B, C, T, H, W) format
         compressed_tokens, _ = self.compressor(z_compress, density_level)
 
         # Project compressed tokens through each layer's k_proj/v_proj
@@ -193,13 +195,13 @@ class PackForcingTrainingPipeline:
             return
 
         z_current = denoised_pred  # NOT detached — gradient flows through
+        z_compress = z_current.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
 
         # Density estimation (routing only, no learnable parameters)
         with torch.no_grad():
-            density_level, density_score, density_info = self.density_estimator(z_current)
+            density_level, density_score, density_info = self.density_estimator(z_compress)
 
         # Compress WITH gradient — HR branch Conv3D is fully differentiable
-        z_compress = z_current.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
         compressed_tokens, _ = self.compressor(z_compress, density_level)
 
         # Project to KV WITH gradient — kv_k_proj / kv_v_proj are learnable
@@ -211,6 +213,41 @@ class PackForcingTrainingPipeline:
 
         # Store in list (differentiable via torch.cat in _get_mid_kv_per_layer)
         self._diff_mid_kv_list.append(kv_compressed[0])  # (2, B, N, heads, head_dim)
+
+    def _queue_clean_block_for_compression(self, clean_block, chunk_idx, current_start_frame):
+        """Compress only blocks that have aged out of the recent window."""
+        self._recent_clean_blocks.append({
+            "latent": clean_block,
+            "chunk_idx": chunk_idx,
+            "start": current_start_frame,
+            "end": current_start_frame + clean_block.shape[1],
+        })
+        cutoff_frame = current_start_frame + clean_block.shape[1] - self.Nrecent
+
+        while self._recent_clean_blocks and self._recent_clean_blocks[0]["end"] <= cutoff_frame:
+            block = self._recent_clean_blocks.pop(0)
+            if block["start"] < self.Nsink:
+                continue
+
+            if self._diff_mode and block["latent"].requires_grad:
+                self._compress_block_differentiable(
+                    denoised_pred=block["latent"],
+                    chunk_idx=block["chunk_idx"],
+                    current_start_frame=block["start"],
+                )
+            else:
+                latent = block["latent"].detach()
+                self._compress_block(
+                    denoised_pred=latent,
+                    chunk_idx=block["chunk_idx"],
+                    current_start_frame=block["start"],
+                )
+                if self._diff_mode:
+                    self._compress_block_differentiable(
+                        denoised_pred=latent,
+                        chunk_idx=block["chunk_idx"],
+                        current_start_frame=block["start"],
+                    )
 
     # ------------------------------------------------------------------
     # Random index sync (same as SelfForcingTrainingPipeline)
@@ -382,32 +419,18 @@ class PackForcingTrainingPipeline:
                     mid_kv_per_layer=self._get_mid_kv_per_layer(),
                 )
 
-            # Step 3.3a: Compress CLEAN latent
+            # Step 3.3a: Queue CLEAN latent and compress only after it ages out
+            # of the full-resolution recent window. Sink frames are never
+            # compressed into mid.
             if is_gradient_block and self._diff_mode:
-                # End-to-end path: keep gradient alive for DMD loss backprop
-                # denoised_pred has been re-noised, use output slice (clean denoised)
                 clean_denoised = output[:, current_start_frame:current_start_frame + current_num_frames]
-                self._compress_block_differentiable(
-                    denoised_pred=clean_denoised,
-                    chunk_idx=block_index,
-                    current_start_frame=current_start_frame,
-                )
             else:
-                # No-gradient path: original in-place cache write
                 clean_denoised = output[:, current_start_frame:current_start_frame + current_num_frames].detach()
-                self._compress_block(
-                    denoised_pred=clean_denoised,
-                    chunk_idx=block_index,
-                    current_start_frame=current_start_frame,
-                )
-                # For diff_mode, also store a detached copy in the list so
-                # _get_mid_kv_per_layer returns consistent mid_kv across all blocks
-                if self._diff_mode:
-                    self._compress_block_differentiable(
-                        denoised_pred=clean_denoised.detach(),
-                        chunk_idx=block_index,
-                        current_start_frame=current_start_frame,
-                    )
+            self._queue_clean_block_for_compression(
+                clean_block=clean_denoised,
+                chunk_idx=block_index,
+                current_start_frame=current_start_frame,
+            )
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames

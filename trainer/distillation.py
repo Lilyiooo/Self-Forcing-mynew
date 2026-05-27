@@ -600,6 +600,16 @@ class Trainer:
         )
         clean_sd = {rename(k): v for k, v in state_dict[key].items()}
         pipeline.generator.load_state_dict(clean_sd, strict=True)
+
+        if "compressor" in state_dict and getattr(
+                getattr(self.config, "heterogeneous_cache", None), "enabled", False):
+            print("[Validation] Loading compressor weights...")
+            pipeline.load_compressor_state_dict(
+                state_dict["compressor"],
+                device=self.device,
+                dtype=torch.bfloat16,
+                strict=True,
+            )
         del state_dict
 
         pipeline = pipeline.to(dtype=torch.bfloat16)

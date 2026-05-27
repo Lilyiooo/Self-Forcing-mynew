@@ -68,7 +68,26 @@ else:
 
 if args.checkpoint_path:
     state_dict = torch.load(args.checkpoint_path, map_location="cpu")
-    pipeline.generator.load_state_dict(state_dict['generator' if not args.use_ema else 'generator_ema'])
+    key = 'generator_ema' if args.use_ema else 'generator'
+    rename = lambda n: (
+        n.replace("_fsdp_wrapped_module.", "")
+         .replace("_checkpoint_wrapped_module.", "")
+         .replace("_orig_mod.", "")
+    )
+    pipeline.generator.load_state_dict(
+        {rename(k): v for k, v in state_dict[key].items()},
+        strict=True,
+    )
+    if "compressor" in state_dict and getattr(
+            getattr(config, "heterogeneous_cache", None), "enabled", False):
+        if hasattr(pipeline, "load_compressor_state_dict"):
+            pipeline.load_compressor_state_dict(
+                state_dict["compressor"],
+                device=device,
+                dtype=torch.bfloat16,
+                strict=True,
+            )
+    del state_dict
 
 pipeline = pipeline.to(dtype=torch.bfloat16)
 if low_memory:
