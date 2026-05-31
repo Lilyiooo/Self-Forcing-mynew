@@ -33,6 +33,7 @@ class PackForcingTrainingPipeline:
         last_step_only: bool = False,
         num_max_frames: int = 20,
         context_noise: int = 0,
+        enable_differentiable_compression: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -53,6 +54,7 @@ class PackForcingTrainingPipeline:
         self.num_frame_per_block = num_frame_per_block
         self.context_noise = context_noise
         self.i2v = False
+        self.enable_differentiable_compression = enable_differentiable_compression
 
         # Read actual model dimensions from generator
         self.model_dim = getattr(generator.model, 'dim', 1536)
@@ -361,7 +363,7 @@ class PackForcingTrainingPipeline:
         )
 
         # Step 0: Set up differentiable compression mode
-        self._diff_mode = torch.is_grad_enabled()
+        self._diff_mode = torch.is_grad_enabled() and self.enable_differentiable_compression
         self._diff_mid_kv_list = []
 
         # Step 1: Initialize heterogeneous KV cache
@@ -452,6 +454,8 @@ class PackForcingTrainingPipeline:
                         )
                     break
 
+            clean_block = denoised_pred
+
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
 
@@ -478,9 +482,9 @@ class PackForcingTrainingPipeline:
             # of the full-resolution recent window. Sink frames are never
             # compressed into mid.
             if is_gradient_block and self._diff_mode:
-                clean_denoised = output[:, current_start_frame:current_start_frame + current_num_frames]
+                clean_denoised = clean_block
             else:
-                clean_denoised = output[:, current_start_frame:current_start_frame + current_num_frames].detach()
+                clean_denoised = clean_block.detach()
             self._queue_clean_block_for_compression(
                 clean_block=clean_denoised,
                 chunk_idx=block_index,

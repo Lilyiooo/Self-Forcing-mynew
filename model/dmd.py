@@ -270,6 +270,7 @@ class DMD(SelfForcingModel):
         """Override to use PackForcingTrainingPipeline when heterogeneous cache is enabled."""
         if self.heterogeneous_cache_enabled:
             from pipeline.packforcing_training import PackForcingTrainingPipeline
+            compressor_train_cfg = getattr(self.args, "compressor_training", None)
             self.inference_pipeline = PackForcingTrainingPipeline(
                 denoising_step_list=self.denoising_step_list,
                 scheduler=self.scheduler,
@@ -283,6 +284,8 @@ class DMD(SelfForcingModel):
                 last_step_only=self.args.last_step_only,
                 num_max_frames=self.num_training_frames,
                 context_noise=self.args.context_noise,
+                enable_differentiable_compression=getattr(
+                    compressor_train_cfg, "end_to_end", False),
             )
             print("[DMD] PackForcingTrainingPipeline initialized")
         else:

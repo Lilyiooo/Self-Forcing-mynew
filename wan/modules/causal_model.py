@@ -838,7 +838,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             if mid_kv_per_layer is not None and block_index < len(mid_kv_per_layer):
                 _mid_kv = mid_kv_per_layer[block_index]
 
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            # KV cache updates are stateful during causal rollout. Checkpoint
+            # recomputation would see a different cache length during backward,
+            # so do not checkpoint this path.
+            if torch.is_grad_enabled() and self.gradient_checkpointing and kv_cache is None:
                 kwargs.update(
                     {
                         "kv_cache": kv_cache[block_index],

@@ -247,7 +247,7 @@ class LRBranch(nn.Module):
                 x_re_chw, size=x_latent_pooled.shape[2:], mode="trilinear", align_corners=False
             )
         recon_err = F.mse_loss(x_re_chw.float(), x_latent_pooled.float())
-        complexity_score = float(torch.sigmoid(recon_err - 0.1))  # rough normalization to [0,1]
+        complexity_score = float(torch.sigmoid(recon_err.detach() - 0.1))  # rough normalization to [0,1]
 
         # project re-encoded latent to tokens using own linear projection
         # x_re_latent: (B, T, C, H, W) -> flatten spatial dims and project
@@ -320,7 +320,8 @@ class HeterogeneousCompressor(nn.Module):
         # Wan2.1-T2V-1.3B latent: C=16, T varies (1 or num_frame_per_block), H=60, W=104
         # After patch_embedding with stride (1,2,2): spatial becomes 30x52
         # For compression, input is the raw latent before patch embedding
-        dummy = torch.zeros(1, in_ch, 2, 60, 104, device=device)
+        dummy_dtype = next(self.hr_high.parameters()).dtype
+        dummy = torch.zeros(1, in_ch, 2, 60, 104, device=device, dtype=dummy_dtype)
         for name, head in [("8x", self.hr_high), ("32x", self.hr_mid), ("128x", self.hr_low)]:
             try:
                 out = head(dummy)

@@ -4,11 +4,17 @@ import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
-from torchvision.io import write_video
 from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
+
+try:
+    from torchvision.io import write_video as _torchvision_write_video
+except ImportError:
+    _torchvision_write_video = None
+
+import imageio
 
 from pipeline import (
     CausalDiffusionInferencePipeline,
@@ -34,6 +40,21 @@ parser.add_argument("--num_samples", type=int, default=1, help="Number of sample
 parser.add_argument("--save_with_index", action="store_true",
                     help="Whether to save the video using the index or prompt as the filename")
 args = parser.parse_args()
+
+
+def write_video(output_path, video, fps=16):
+    """Write THWC uint8/float video with torchvision when available, else imageio."""
+    if _torchvision_write_video is not None:
+        _torchvision_write_video(output_path, video, fps=fps)
+        return
+
+    video_np = video.clamp(0, 255).to(torch.uint8).cpu().numpy()
+    writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=5)
+    try:
+        for frame in video_np:
+            writer.append_data(frame)
+    finally:
+        writer.close()
 
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
@@ -81,12 +102,16 @@ if args.checkpoint_path:
     if "compressor" in state_dict and getattr(
             getattr(config, "heterogeneous_cache", None), "enabled", False):
         if hasattr(pipeline, "load_compressor_state_dict"):
+            print("[Inference] Loading compressor weights...")
             pipeline.load_compressor_state_dict(
                 state_dict["compressor"],
                 device=device,
                 dtype=torch.bfloat16,
                 strict=True,
             )
+    elif getattr(getattr(config, "heterogeneous_cache", None), "enabled", False):
+        print("[Inference] WARNING: checkpoint has no compressor; "
+              "using a randomly initialized lazy compressor for shape smoke only.")
     del state_dict
 
 pipeline = pipeline.to(dtype=torch.bfloat16)

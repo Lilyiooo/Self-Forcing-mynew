@@ -471,14 +471,15 @@ class Trainer:
             if self.heterogeneous_cache_enabled and self.compressor is not None:
                 # Get pred_image from generator_log_dict for recon loss
                 if "pred_image" in generator_log_dict:
-                    recon_loss = self._compute_reconstruction_loss(generator_log_dict["pred_image"])
                     if self.step >= self.recon_warmup_steps:
                         lambda_r = self.lambda_recon
                     else:
                         # Linear warmup
                         lambda_r = self.lambda_recon * (self.step / max(1, self.recon_warmup_steps))
-                    total_loss = total_loss + lambda_r * recon_loss
-                    generator_log_dict["recon_loss"] = recon_loss
+                    if lambda_r > 0:
+                        recon_loss = self._compute_reconstruction_loss(generator_log_dict["pred_image"])
+                        total_loss = total_loss + lambda_r * recon_loss
+                        generator_log_dict["recon_loss"] = recon_loss
                     generator_log_dict["effective_lambda"] = lambda_r
 
             total_loss.backward()
@@ -494,6 +495,8 @@ class Trainer:
                 )
                 self.compressor_optimizer.step()
                 generator_log_dict["compressor_grad_norm"] = compressor_grad_norm
+                if self.is_main_process:
+                    print(f"compressor_grad_norm: {compressor_grad_norm.item():.6f}")
 
             generator_log_dict.update({"generator_loss": total_loss,
                                        "generator_grad_norm": generator_grad_norm})
@@ -697,17 +700,26 @@ class Trainer:
             # Increment the step since we finished gradient update
             self.step += 1
 
+            max_train_steps = getattr(self.config, "max_train_steps", None)
+            reached_max_train_steps = max_train_steps is not None and self.step >= max_train_steps
+
             # Create EMA params (if not already created)
             if (self.step >= self.config.ema_start_step) and \
                     (self.generator_ema is None) and (self.config.ema_weight > 0):
                 self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
 
             # Save the model
-            if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
+            should_save = (
+                (not self.config.no_save)
+                and (self.step - start_step) > 0
+                and (self.step % self.config.log_iters == 0 or reached_max_train_steps)
+            )
+            if should_save:
                 torch.cuda.empty_cache()
                 self.save()
                 torch.cuda.empty_cache()
-                self.validate()
+                if not reached_max_train_steps:
+                    self.validate()
 
             # Logging
             if self.is_main_process:
@@ -750,3 +762,8 @@ class Trainer:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
+
+            if reached_max_train_steps:
+                if self.is_main_process:
+                    print(f"[Debug] Reached max_train_steps={max_train_steps}, exiting.")
+                break
