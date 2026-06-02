@@ -29,6 +29,11 @@ def main():
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir
     config.disable_wandb = args.disable_wandb
+    if getattr(getattr(config, "heterogeneous_cache", None), "debug_log_cache", False) \
+            and not getattr(config.heterogeneous_cache, "debug_log_path", None):
+        log_root = args.logdir or os.path.join("logs", "debug", config_name)
+        config.heterogeneous_cache.debug_log_path = os.path.join(
+            log_root, "cache_debug_train_rank{rank}.jsonl")
 
     if config.trainer == "diffusion":
         trainer = DiffusionTrainer(config)

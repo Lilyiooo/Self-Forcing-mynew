@@ -23,6 +23,7 @@ class MidBlockMeta:
     n_frames: int            # number of latent frames represented by this block
     kv_slice: slice          # position in mid_kv_buffer tensor
     temporal_position: int   # absolute frame index when generated (for RoPE adjustment)
+    block_id: int = 0         # monotonic compressed block id
 
 
 class HeterogeneousKVCache:
@@ -45,6 +46,8 @@ class HeterogeneousKVCache:
         frame_seq_length: int = 1560,  # tokens per latent frame
         local_attn_size: int = -1,     # local attention window size (-1 = global)
         eviction_policy: str = "density",
+        top_k_enabled: bool = False,
+        top_k_blocks: int = 8,
     ):
         self.batch_size = batch_size
         self.num_transformer_blocks = num_transformer_blocks
@@ -59,6 +62,11 @@ class HeterogeneousKVCache:
         self.local_attn_size = local_attn_size
         self.eviction_policy = eviction_policy
         self.rope_delta_frames = 0
+        self.debug_logger = None
+        self.top_k_enabled = top_k_enabled
+        self.top_k_blocks = top_k_blocks
+        self._next_block_id = 0
+        self._last_logged_selection = None
 
         # Total KV cache size for recent + sink zones
         if local_attn_size != -1:
@@ -87,6 +95,7 @@ class HeterogeneousKVCache:
         # Mid buffer tensors (per-layer)
         self.mid_kv_buffers: Optional[list[torch.Tensor]] = None  # lazy init
         self.mid_token_count: int = 0
+        self.mid_archive_kv: list[list[torch.Tensor]] = []
 
         # Cross-attention cache (same as original)
         self.crossattn_cache: list[dict] = []
@@ -96,6 +105,38 @@ class HeterogeneousKVCache:
                 "v": torch.zeros([batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
                 "is_init": False
             })
+
+    def set_debug_logger(self, logger) -> None:
+        self.debug_logger = logger
+        for layer_idx, cache in enumerate(self.layer_caches):
+            cache["_debug_logger"] = logger
+            cache["_debug_layer_idx"] = layer_idx
+            cache["_debug_frame_seq_length"] = self.frame_seq_length
+
+    def _record_debug_event(self, event: str, **fields) -> None:
+        if self.debug_logger is not None:
+            self.debug_logger.log(event, **fields)
+
+    def _new_meta(
+        self,
+        density_level: str,
+        density_score: float,
+        n_tokens: int,
+        n_frames: int,
+        kv_slice: slice,
+        temporal_position: int,
+    ) -> MidBlockMeta:
+        meta = MidBlockMeta(
+            block_id=self._next_block_id,
+            density_level=density_level,
+            density_score=density_score,
+            n_tokens=n_tokens,
+            n_frames=n_frames,
+            kv_slice=kv_slice,
+            temporal_position=temporal_position,
+        )
+        self._next_block_id += 1
+        return meta
 
     # ------------------------------------------------------------------
     # Mid buffer operations
@@ -134,6 +175,33 @@ class HeterogeneousKVCache:
         if isinstance(kv_compressed, list):
             # Per-layer compressed KV
             N_new = kv_compressed[0].shape[2]
+            if self.top_k_enabled:
+                meta = self._new_meta(
+                    density_level=density_level,
+                    density_score=density_score,
+                    n_tokens=N_new,
+                    n_frames=n_frames,
+                    kv_slice=slice(0, N_new),
+                    temporal_position=temporal_position,
+                )
+                self.mid_meta.append(meta)
+                self.mid_archive_kv.append([kvc.detach().clone() for kvc in kv_compressed])
+                self.mid_token_count = self._selected_mid_token_count()
+                self._record_debug_event(
+                    "mid_archive_insert",
+                    block_id=meta.block_id,
+                    density_level=density_level,
+                    density_score=float(density_score),
+                    n_tokens=N_new,
+                    n_frames=n_frames,
+                    temporal_position=temporal_position,
+                    block_start=temporal_position,
+                    block_end=temporal_position + n_frames,
+                    archive_blocks=len(self.mid_meta),
+                    active_mid_token_count=self.mid_token_count,
+                    rope_delta_frames=self.rope_delta_frames,
+                )
+                return
             self._ensure_mid_buffers(kv_compressed[0])
 
             # Eviction: evict lowest density blocks until enough space
@@ -153,7 +221,7 @@ class HeterogeneousKVCache:
 
             # Update metadata
             self.mid_token_count = end
-            self.mid_meta.append(MidBlockMeta(
+            self.mid_meta.append(self._new_meta(
                 density_level=density_level,
                 density_score=density_score,
                 n_tokens=N_new,
@@ -161,9 +229,51 @@ class HeterogeneousKVCache:
                 kv_slice=slice(start, end),
                 temporal_position=temporal_position,
             ))
+            self._record_debug_event(
+                "mid_insert",
+                density_level=density_level,
+                density_score=float(density_score),
+                n_tokens=N_new,
+                n_frames=n_frames,
+                temporal_position=temporal_position,
+                block_start=temporal_position,
+                block_end=temporal_position + n_frames,
+                mid_token_count=self.mid_token_count,
+                len_mid_meta=len(self.mid_meta),
+                rope_delta_frames=self.rope_delta_frames,
+            )
         else:
             # Single shared tensor (broadcast to all layers)
             N_new = kv_compressed.shape[2]
+            if self.top_k_enabled:
+                meta = self._new_meta(
+                    density_level=density_level,
+                    density_score=density_score,
+                    n_tokens=N_new,
+                    n_frames=n_frames,
+                    kv_slice=slice(0, N_new),
+                    temporal_position=temporal_position,
+                )
+                self.mid_meta.append(meta)
+                self.mid_archive_kv.append(
+                    [kv_compressed.detach().clone() for _ in range(self.num_transformer_blocks)]
+                )
+                self.mid_token_count = self._selected_mid_token_count()
+                self._record_debug_event(
+                    "mid_archive_insert",
+                    block_id=meta.block_id,
+                    density_level=density_level,
+                    density_score=float(density_score),
+                    n_tokens=N_new,
+                    n_frames=n_frames,
+                    temporal_position=temporal_position,
+                    block_start=temporal_position,
+                    block_end=temporal_position + n_frames,
+                    archive_blocks=len(self.mid_meta),
+                    active_mid_token_count=self.mid_token_count,
+                    rope_delta_frames=self.rope_delta_frames,
+                )
+                return
             self._ensure_mid_buffers(kv_compressed)
 
             while self.mid_token_count + N_new > self.Nmid_tokens and self.mid_meta:
@@ -179,7 +289,7 @@ class HeterogeneousKVCache:
                 self.mid_kv_buffers[layer_idx][:, :, start:end, :, :] = kv_compressed
 
             self.mid_token_count = end
-            self.mid_meta.append(MidBlockMeta(
+            self.mid_meta.append(self._new_meta(
                 density_level=density_level,
                 density_score=density_score,
                 n_tokens=N_new,
@@ -187,6 +297,19 @@ class HeterogeneousKVCache:
                 kv_slice=slice(start, end),
                 temporal_position=temporal_position,
             ))
+            self._record_debug_event(
+                "mid_insert",
+                density_level=density_level,
+                density_score=float(density_score),
+                n_tokens=N_new,
+                n_frames=n_frames,
+                temporal_position=temporal_position,
+                block_start=temporal_position,
+                block_end=temporal_position + n_frames,
+                mid_token_count=self.mid_token_count,
+                len_mid_meta=len(self.mid_meta),
+                rope_delta_frames=self.rope_delta_frames,
+            )
 
         assert self.mid_token_count <= self.Nmid_tokens, \
             f"mid buffer overflow: {self.mid_token_count} > {self.Nmid_tokens}"
@@ -217,6 +340,7 @@ class HeterogeneousKVCache:
         ev_n = evicted.n_tokens
         if self.eviction_policy == "fifo":
             self.rope_delta_frames += evicted.n_frames
+        updated_rope_delta = self.rope_delta_frames
 
         # In-place move: shift tokens after ev_slice forward
         end = self.mid_token_count
@@ -236,20 +360,66 @@ class HeterogeneousKVCache:
             if s.start >= ev_end:
                 meta.kv_slice = slice(s.start - ev_n, s.stop - ev_n)
 
+        self._record_debug_event(
+            "mid_evict",
+            eviction_policy=self.eviction_policy,
+            evicted_index=evict_idx,
+            evicted_temporal_position=evicted.temporal_position,
+            evicted_n_frames=evicted.n_frames,
+            evicted_n_tokens=ev_n,
+            updated_rope_delta_frames=updated_rope_delta,
+            mid_token_count=self.mid_token_count,
+            len_mid_meta=len(self.mid_meta),
+        )
+
     def get_mid_kv(self, layer_idx: int = 0) -> Optional[torch.Tensor]:
         """
         Return the current mid buffer KV for a specific layer.
         shape: (2, B, mid_token_count, n_heads, head_dim) or None if empty
         """
+        if self.top_k_enabled:
+            selected = self._selected_archive_indices()
+            if not selected:
+                self.mid_token_count = 0
+                return None
+            if layer_idx == 0:
+                signature = tuple(self.mid_meta[i].block_id for i in selected)
+                if signature != self._last_logged_selection:
+                    self._last_logged_selection = signature
+                    self._record_debug_event(
+                        "mid_select",
+                        strategy="recency",
+                        top_k_blocks=self.top_k_blocks,
+                        selected_block_ids=list(signature),
+                        selected_temporal_positions=[
+                            self.mid_meta[i].temporal_position for i in selected
+                        ],
+                        selected_n_tokens=[self.mid_meta[i].n_tokens for i in selected],
+                    )
+            kv = torch.cat([self.mid_archive_kv[i][layer_idx] for i in selected], dim=2)
+            self.mid_token_count = kv.shape[2]
+            return kv
         if self.mid_kv_buffers is None or self.mid_token_count == 0:
             return None
         return self.mid_kv_buffers[layer_idx][:, :, :self.mid_token_count, :, :]
 
+    def _selected_archive_indices(self) -> list[int]:
+        if not self.mid_meta:
+            return []
+        start = max(0, len(self.mid_meta) - self.top_k_blocks)
+        return list(range(start, len(self.mid_meta)))
+
+    def _selected_mid_token_count(self) -> int:
+        return sum(self.mid_meta[i].n_tokens for i in self._selected_archive_indices())
+
     def reset_mid_buffer(self) -> None:
         """Reset mid buffer at the start of each video generation."""
         self.mid_meta = []
+        self.mid_archive_kv = []
         self.mid_token_count = 0
         self.rope_delta_frames = 0
+        self._next_block_id = 0
+        self._last_logged_selection = None
         # Don't zero mid_kv_buffers tensors; next writes will overwrite
 
     # ------------------------------------------------------------------

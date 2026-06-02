@@ -242,9 +242,26 @@ class CausalWanSelfAttention(nn.Module):
                 mid_v = mid_kv[1]  # (B, N_mid, n_heads, head_dim)
                 attn_k = torch.cat([sink_k, mid_k, recent_k], dim=1)
                 attn_v = torch.cat([sink_v, mid_v, recent_v], dim=1)
+                mid_len = mid_k.shape[1]
             else:
                 attn_k = torch.cat([sink_k, recent_k], dim=1)
                 attn_v = torch.cat([sink_v, recent_v], dim=1)
+                mid_len = 0
+
+            debug_logger = kv_cache.get("_debug_logger") if kv_cache is not None else None
+            if debug_logger is not None:
+                debug_logger.log(
+                    "attention_context",
+                    layer_idx=kv_cache.get("_debug_layer_idx"),
+                    current_start=current_start,
+                    current_start_frame=current_start_frame,
+                    sink_len=sink_k.shape[1],
+                    mid_len=mid_len,
+                    recent_len=recent_k.shape[1],
+                    total_len=attn_k.shape[1],
+                    local_end_index=local_end_index,
+                    global_end_index=current_end,
+                )
 
             x = attention(
                 roped_query,

@@ -56,6 +56,8 @@ heterogeneous_cache:
   Nrecent: 4
   Nmid_tokens: 5000
   eviction_policy: fifo
+  debug_log_cache: true
+  debug_log_print: false
 density_estimator:
   delta_high: 1.1
   delta_low: -0.1
@@ -65,15 +67,17 @@ compressor:
   d_model: 1536
   in_ch: 16
 top_k:
-  enabled: false
-  top_k_tokens: 1000
+  enabled: true
+  top_k_blocks: 8
+  selection_once_per_chunk: true
+  selection_strategy: recency
 compressor_training:
   pretrain_epochs: 0
   pretrain_lr: 0.001
   pretrain_batch_size: 2
   lambda_recon: 0.0
   warmup_steps: 100
-  end_to_end: true
+  end_to_end: false
   compressor_lr: 0.0001
   compressor_grad_clip: 1.0
 val_num_latent_frames: 240

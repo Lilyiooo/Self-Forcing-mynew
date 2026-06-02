@@ -46,12 +46,29 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
 
     os.environ["NCCL_CROSS_NIC"] = "1"
 
+    requested_sharding_strategy = sharding_strategy
     sharding_strategy = {
         "full": ShardingStrategy.FULL_SHARD,
         "hybrid_full": ShardingStrategy.HYBRID_SHARD,
         "hybrid_zero2": ShardingStrategy._HYBRID_SHARD_ZERO2,
         "no_shard": ShardingStrategy.NO_SHARD,
     }[sharding_strategy]
+
+    if requested_sharding_strategy.startswith("hybrid") and dist.is_initialized():
+        world_size = dist.get_world_size()
+        visible_devices = torch.cuda.device_count()
+        if visible_devices > world_size:
+            fallback = {
+                "hybrid_full": ShardingStrategy.FULL_SHARD,
+                "hybrid_zero2": ShardingStrategy.SHARD_GRAD_OP,
+            }[requested_sharding_strategy]
+            if dist.get_rank() == 0:
+                print(
+                    f"[FSDP] {requested_sharding_strategy} requires a full visible-device "
+                    f"subgroup, but world_size={world_size} < cuda_device_count={visible_devices}. "
+                    f"Falling back to {fallback.name}."
+                )
+            sharding_strategy = fallback
 
     module = FSDP(
         module,

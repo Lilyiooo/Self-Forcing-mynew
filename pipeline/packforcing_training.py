@@ -15,6 +15,7 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 from utils.cache_lifecycle import queue_aged_blocks
+from utils.cache_debug import make_cache_debug_logger
 from utils.rope_utils import apply_temporal_rope_shift, apply_temporal_rope_to_unrotated
 
 
@@ -34,6 +35,7 @@ class PackForcingTrainingPipeline:
         num_max_frames: int = 20,
         context_noise: int = 0,
         enable_differentiable_compression: bool = False,
+        top_k_config=None,
         **kwargs
     ):
         super().__init__()
@@ -42,6 +44,7 @@ class PackForcingTrainingPipeline:
         self.denoising_step_list = denoising_step_list
         if self.denoising_step_list[-1] == 0:
             self.denoising_step_list = self.denoising_step_list[:-1]
+        self._rank = dist.get_rank() if dist.is_initialized() else 0
 
         # Compressor and density estimator (owned by DMD model, passed in)
         self.compressor = compressor
@@ -67,6 +70,16 @@ class PackForcingTrainingPipeline:
         self.Nsink = getattr(het_cache_config, "Nsink", 8)
         self.Nrecent = getattr(het_cache_config, "Nrecent", 4)
         self.Nmid_tokens = getattr(het_cache_config, "Nmid_tokens", 5000)
+        self.top_k_enabled = getattr(
+            top_k_config,
+            "enabled",
+            getattr(het_cache_config, "top_k_enabled", False),
+        )
+        self.top_k_blocks = getattr(
+            top_k_config,
+            "top_k_blocks",
+            getattr(het_cache_config, "top_k_blocks", 8),
+        )
         effective_window = self.Nsink + self.Nrecent + self.num_frame_per_block
         self.effective_window = effective_window
 
@@ -88,6 +101,11 @@ class PackForcingTrainingPipeline:
         self._diff_mid_kv_list: List[torch.Tensor] = []
         self._diff_mode: bool = False
         self._applied_rope_delta_frames = 0
+        self.cache_debug_logger = make_cache_debug_logger(het_cache_config)
+
+    def _rank0_print(self, message: str) -> None:
+        if self._rank == 0:
+            print(message, flush=True)
 
     # ------------------------------------------------------------------
     # Cache initialization (three-zone heterogeneous cache)
@@ -118,7 +136,11 @@ class PackForcingTrainingPipeline:
             frame_seq_length=self.frame_seq_length,
             local_attn_size=self.effective_window,
             eviction_policy=getattr(self.het_cache_config, "eviction_policy", "density"),
+            top_k_enabled=self.top_k_enabled,
+            top_k_blocks=self.top_k_blocks,
         )
+        if self.cache_debug_logger is not None:
+            self.het_kv_cache.set_debug_logger(self.cache_debug_logger)
 
         # Reset density estimator for each new video
         self.density_estimator.reset()
@@ -128,6 +150,22 @@ class PackForcingTrainingPipeline:
         # Set up backward-compatible aliases
         self.kv_cache1 = [self.het_kv_cache.get_layer_cache(i) for i in range(self.num_transformer_blocks)]
         self.crossattn_cache = [self.het_kv_cache.get_crossattn_cache(i) for i in range(self.num_transformer_blocks)]
+
+    def _log_cache_block_state(self, chunk_idx: int, current_start_frame: int, event: str) -> None:
+        if self.cache_debug_logger is None or self.het_kv_cache is None:
+            return
+        self.cache_debug_logger.log(
+            event,
+            chunk_idx=chunk_idx,
+            current_start_frame=current_start_frame,
+            current_time_sec=float(current_start_frame * 4 / 16.0),
+            recent_queue_len=len(self._recent_clean_blocks),
+            mid_token_count=self.het_kv_cache.mid_token_count,
+            len_mid_meta=len(self.het_kv_cache.mid_meta),
+            rope_delta_frames=self.het_kv_cache.rope_delta_frames,
+            applied_rope_delta_frames=self._applied_rope_delta_frames,
+            diff_mode=self._diff_mode,
+        )
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """Cross-attention cache is handled by HeterogeneousKVCache. No-op."""
@@ -204,6 +242,14 @@ class PackForcingTrainingPipeline:
                 delta=delta,
             )
         self._applied_rope_delta_frames = total_delta
+        if self.cache_debug_logger is not None:
+            self.cache_debug_logger.log(
+                "sink_rope_correction",
+                delta=delta,
+                rope_delta_frames=total_delta,
+                applied_rope_delta_frames=self._applied_rope_delta_frames,
+                diff_mode=self._diff_mode,
+            )
 
     @torch.no_grad()
     def _compress_block(self, denoised_pred, chunk_idx, current_start_frame):
@@ -211,6 +257,9 @@ class PackForcingTrainingPipeline:
         if self.het_kv_cache is None or self.compressor is None:
             return
 
+        self._rank0_print(
+            f"[PackForcing] compress block chunk={chunk_idx}, start={current_start_frame}"
+        )
         z_current = denoised_pred  # (B, T, C, H, W)
         z_compress = z_current.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
 
@@ -238,6 +287,23 @@ class PackForcingTrainingPipeline:
             n_frames=denoised_pred.shape[1],
         )
         self._apply_sink_rope_correction_if_needed()
+        if self.cache_debug_logger is not None:
+            inserted_tokens = self.het_kv_cache.mid_meta[-1].n_tokens if self.het_kv_cache.mid_meta else 0
+            self.cache_debug_logger.log(
+                "block_compressed",
+                chunk_idx=chunk_idx,
+                block_start=current_start_frame,
+                block_end=current_start_frame + denoised_pred.shape[1],
+                density_level=density_level,
+                density_score=float(density_score),
+                n_tokens=inserted_tokens,
+                raw_n_tokens=compressed_tokens.shape[1],
+                temporal_position=current_start_frame,
+                mid_token_count=self.het_kv_cache.mid_token_count,
+                rope_delta_frames=self.het_kv_cache.rope_delta_frames,
+                applied_rope_delta_frames=self._applied_rope_delta_frames,
+                diff_mode=self._diff_mode,
+            )
 
     def _compress_block_differentiable(self, denoised_pred, chunk_idx, current_start_frame):
         """
@@ -274,6 +340,19 @@ class PackForcingTrainingPipeline:
 
         # Store in list (differentiable via torch.cat in _get_mid_kv_per_layer)
         self._diff_mid_kv_list.append(kv_compressed[0])  # (2, B, N, heads, head_dim)
+        if self.cache_debug_logger is not None:
+            self.cache_debug_logger.log(
+                "block_compressed_diff_path",
+                chunk_idx=chunk_idx,
+                block_start=current_start_frame,
+                block_end=current_start_frame + denoised_pred.shape[1],
+                density_level=density_level,
+                density_score=float(density_score),
+                n_tokens=compressed_tokens.shape[1],
+                temporal_position=current_start_frame,
+                diff_mid_blocks=len(self._diff_mid_kv_list),
+                diff_mode=self._diff_mode,
+            )
 
     def _queue_clean_block_for_compression(self, clean_block, chunk_idx, current_start_frame):
         """Compress only blocks that have aged out of the recent window."""
@@ -348,6 +427,10 @@ class PackForcingTrainingPipeline:
         gradient chain from DMD loss through attention back to compressor parameters.
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self._rank0_print(
+            f"[PackForcing] rollout start: frames={num_frames}, "
+            f"block={self.num_frame_per_block}, diff={torch.is_grad_enabled() and self.enable_differentiable_compression}"
+        )
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             assert num_frames % self.num_frame_per_block == 0
             num_blocks = num_frames // self.num_frame_per_block
@@ -369,6 +452,11 @@ class PackForcingTrainingPipeline:
         # Step 1: Initialize heterogeneous KV cache
         self._initialize_kv_cache(
             batch_size=batch_size, dtype=noise.dtype, device=noise.device
+        )
+        self._log_cache_block_state(
+            chunk_idx=-1,
+            current_start_frame=0,
+            event="cache_initialized",
         )
 
         # Step 2: Cache context feature
@@ -397,6 +485,10 @@ class PackForcingTrainingPipeline:
         start_gradient_frame_index = num_output_frames - 20  # last 20 frames get gradients
 
         for block_index, current_num_frames in enumerate(all_num_frames):
+            self._rank0_print(
+                f"[PackForcing] block {block_index + 1}/{len(all_num_frames)} "
+                f"start={current_start_frame}, frames={current_num_frames}"
+            )
             noisy_input = noise[
                 :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
             is_gradient_block = current_start_frame >= start_gradient_frame_index
@@ -489,6 +581,11 @@ class PackForcingTrainingPipeline:
                 clean_block=clean_denoised,
                 chunk_idx=block_index,
                 current_start_frame=current_start_frame,
+            )
+            self._log_cache_block_state(
+                chunk_idx=block_index,
+                current_start_frame=current_start_frame,
+                event="block_generated",
             )
 
             # Step 3.4: update the start and end frame indices

@@ -315,14 +315,20 @@ class HeterogeneousCompressor(nn.Module):
             w = (w - 1) // 2 + 1
         return t, h, w
 
-    def _validate_heads(self, in_ch: int, device: torch.device):
+    def _validate_heads(self, in_ch: int, device: torch.device, density_level: DensityLevel | None = None):
         """Validate HR head output shapes with a dummy input."""
         # Wan2.1-T2V-1.3B latent: C=16, T varies (1 or num_frame_per_block), H=60, W=104
         # After patch_embedding with stride (1,2,2): spatial becomes 30x52
         # For compression, input is the raw latent before patch embedding
         dummy_dtype = next(self.hr_high.parameters()).dtype
         dummy = torch.zeros(1, in_ch, 2, 60, 104, device=device, dtype=dummy_dtype)
-        for name, head in [("8x", self.hr_high), ("32x", self.hr_mid), ("128x", self.hr_low)]:
+        heads = {
+            "high": [("8x", self.hr_high)],
+            "mid": [("32x", self.hr_mid)],
+            "low": [("128x", self.hr_low)],
+            None: [("8x", self.hr_high), ("32x", self.hr_mid), ("128x", self.hr_low)],
+        }[density_level]
+        for name, head in heads:
             try:
                 out = head(dummy)
                 print(f"  HR {name} output tokens: {out.shape[1]} (shape: {out.shape})")
@@ -342,7 +348,7 @@ class HeterogeneousCompressor(nn.Module):
         """
         # Validate on first call
         if not self._validated:
-            self._validate_heads(x.shape[1], x.device)
+            self._validate_heads(x.shape[1], x.device, density_level=density_level)
 
         if density_level == "high":
             hr_tokens = self.hr_high(x)

@@ -78,6 +78,10 @@ torch.set_grad_enabled(False)
 config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load("configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
+if getattr(getattr(config, "heterogeneous_cache", None), "debug_log_cache", False) \
+        and not getattr(config.heterogeneous_cache, "debug_log_path", None):
+    config.heterogeneous_cache.debug_log_path = os.path.join(
+        args.output_folder or "outputs", "cache_debug_infer_rank{rank}.jsonl")
 
 # Initialize pipeline
 if hasattr(config, 'denoising_step_list'):

@@ -33,12 +33,12 @@ batch_size: 1
 ema_weight: 0.0
 ema_start_step: 999999
 total_batch_size: 64
-log_iters: 750
+log_iters: 50
 negative_prompt: 色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走
 dfake_gen_update_ratio: 5
 image_or_video_shape:
 - 1
-- 20
+- 24
 - 16
 - 60
 - 104
@@ -47,15 +47,17 @@ trainer: score_distillation
 gradient_checkpointing: true
 num_frame_per_block: 4
 load_raw_video: false
-num_training_frames: 20
+num_training_frames: 24
 model_kwargs:
   timestep_shift: 5.0
 heterogeneous_cache:
   enabled: true
   Nsink: 8
   Nrecent: 4
-  Nmid_tokens: 5000
+  Nmid_tokens: 100
   eviction_policy: fifo
+  debug_log_cache: true
+  debug_log_print: false
 density_estimator:
   delta_high: 1.1
   delta_low: -0.1
@@ -73,10 +75,10 @@ compressor_training:
   pretrain_batch_size: 2
   lambda_recon: 0.0
   warmup_steps: 100
-  end_to_end: true
+  end_to_end: false
   compressor_lr: 0.0001
   compressor_grad_clip: 1.0
 val_num_latent_frames: 240
 prompt_path: prompts/validation_60s.txt
 num_val_prompts: 2
-max_train_steps: 750
+max_train_steps: 50

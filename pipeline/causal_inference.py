@@ -3,6 +3,7 @@ import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.cache_lifecycle import queue_aged_blocks
+from utils.cache_debug import make_cache_debug_logger
 from utils.rope_utils import apply_temporal_rope_shift, apply_temporal_rope_to_unrotated
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
@@ -72,6 +73,17 @@ class CausalInferencePipeline(torch.nn.Module):
         if het_cfg is not None and getattr(het_cfg, "enabled", False):
             self.heterogeneous_cache_enabled = True
             self.het_cache_config = het_cfg
+            top_k_cfg = getattr(args, "top_k", None)
+            self.top_k_enabled = getattr(
+                top_k_cfg,
+                "enabled",
+                getattr(het_cfg, "top_k_enabled", False),
+            )
+            self.top_k_blocks = getattr(
+                top_k_cfg,
+                "top_k_blocks",
+                getattr(het_cfg, "top_k_blocks", 8),
+            )
             print(f"Heterogeneous KV cache enabled: Nsink={het_cfg.Nsink}, "
                   f"Nrecent={het_cfg.Nrecent}, Nmid_tokens={het_cfg.Nmid_tokens}")
 
@@ -89,6 +101,9 @@ class CausalInferencePipeline(torch.nn.Module):
             self.het_kv_cache = None
             self._recent_clean_blocks = []
             self._applied_rope_delta_frames = 0
+            self.cache_debug_logger = make_cache_debug_logger(args)
+        else:
+            self.cache_debug_logger = None
 
     def load_compressor_state_dict(self, state_dict, device=None, dtype=None, strict=True):
         """Load trained heterogeneous compressor weights for validation/inference."""
@@ -177,6 +192,11 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.heterogeneous_cache_enabled:
             self._initialize_heterogeneous_cache(
                 batch_size=batch_size, dtype=noise.dtype, device=noise.device
+            )
+            self._log_cache_block_state(
+                chunk_idx=-1,
+                current_start_frame=0,
+                event="cache_initialized",
             )
         else:
             if self.kv_cache1 is None:
@@ -309,6 +329,11 @@ class CausalInferencePipeline(torch.nn.Module):
                     z_prev_chunk=z_prev_chunk,
                 )
                 z_prev_chunk = clean_denoised
+                self._log_cache_block_state(
+                    chunk_idx=chunk_idx,
+                    current_start_frame=current_start_frame,
+                    event="block_generated",
+                )
 
             if profile:
                 block_end.record()
@@ -440,7 +465,11 @@ class CausalInferencePipeline(torch.nn.Module):
             frame_seq_length=self.frame_seq_length,
             local_attn_size=effective_window,
             eviction_policy=getattr(het_cfg, "eviction_policy", "density"),
+            top_k_enabled=self.top_k_enabled,
+            top_k_blocks=self.top_k_blocks,
         )
+        if self.cache_debug_logger is not None:
+            self.het_kv_cache.set_debug_logger(self.cache_debug_logger)
 
         # Reset density estimator
         self.density_estimator.reset_stats()
@@ -450,6 +479,21 @@ class CausalInferencePipeline(torch.nn.Module):
         # Set up the old-style caches as aliases for backward compatibility
         self.kv_cache1 = [self.het_kv_cache.get_layer_cache(i) for i in range(self.num_transformer_blocks)]
         self.crossattn_cache = [self.het_kv_cache.get_crossattn_cache(i) for i in range(self.num_transformer_blocks)]
+
+    def _log_cache_block_state(self, chunk_idx: int, current_start_frame: int, event: str) -> None:
+        if self.cache_debug_logger is None or self.het_kv_cache is None:
+            return
+        self.cache_debug_logger.log(
+            event,
+            chunk_idx=chunk_idx,
+            current_start_frame=current_start_frame,
+            current_time_sec=float(current_start_frame * 4 / 16.0),
+            recent_queue_len=len(self._recent_clean_blocks),
+            mid_token_count=self.het_kv_cache.mid_token_count,
+            len_mid_meta=len(self.het_kv_cache.mid_meta),
+            rope_delta_frames=self.het_kv_cache.rope_delta_frames,
+            applied_rope_delta_frames=self._applied_rope_delta_frames,
+        )
 
     def _run_generator(self, noisy_image_or_video, conditional_dict, timestep, current_start_frame):
         """Run generator with or without heterogeneous cache."""
@@ -530,6 +574,13 @@ class CausalInferencePipeline(torch.nn.Module):
                 delta=delta,
             )
         self._applied_rope_delta_frames = total_delta
+        if self.cache_debug_logger is not None:
+            self.cache_debug_logger.log(
+                "sink_rope_correction",
+                delta=delta,
+                rope_delta_frames=total_delta,
+                applied_rope_delta_frames=self._applied_rope_delta_frames,
+            )
 
     @torch.no_grad()
     def _maybe_compress_block(self, denoised_pred, chunk_idx, current_start_frame, z_prev_chunk):
@@ -570,6 +621,22 @@ class CausalInferencePipeline(torch.nn.Module):
         self._apply_sink_rope_correction_if_needed()
 
         B, N, D = compressed_tokens.shape
+        if self.cache_debug_logger is not None:
+            inserted_tokens = self.het_kv_cache.mid_meta[-1].n_tokens if self.het_kv_cache.mid_meta else 0
+            self.cache_debug_logger.log(
+                "block_compressed",
+                chunk_idx=chunk_idx,
+                block_start=current_start_frame,
+                block_end=current_start_frame + denoised_pred.shape[1],
+                density_level=density_level,
+                density_score=float(density_score),
+                n_tokens=inserted_tokens,
+                raw_n_tokens=N,
+                temporal_position=current_start_frame,
+                mid_token_count=self.het_kv_cache.mid_token_count,
+                rope_delta_frames=self.het_kv_cache.rope_delta_frames,
+                applied_rope_delta_frames=self._applied_rope_delta_frames,
+            )
         print(f"  [HetCache] chunk {chunk_idx}: density={density_score:.3f} ({density_level}), "
               f"tokens={N}, mid_total={self.het_kv_cache.mid_token_count}/{self.het_kv_cache.Nmid_tokens}")
 

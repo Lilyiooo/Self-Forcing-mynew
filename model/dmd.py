@@ -286,6 +286,7 @@ class DMD(SelfForcingModel):
                 context_noise=self.args.context_noise,
                 enable_differentiable_compression=getattr(
                     compressor_train_cfg, "end_to_end", False),
+                top_k_config=getattr(self.args, "top_k", None),
             )
             print("[DMD] PackForcingTrainingPipeline initialized")
         else:
@@ -321,6 +322,8 @@ class DMD(SelfForcingModel):
                 conditional_dict=conditional_dict,
                 initial_latent=initial_latent
             )
+        generated_shape = list(generated_image.shape)
+        generated_batch_size, generated_num_frame = generated_shape[:2]
 
         # Step 2: Compute the fake prediction
         min_timestep = denoised_timestep_to if self.ts_schedule and denoised_timestep_to is not None else self.min_score_timestep
@@ -328,8 +331,8 @@ class DMD(SelfForcingModel):
         critic_timestep = self._get_timestep(
             min_timestep,
             max_timestep,
-            image_or_video_shape[0],
-            image_or_video_shape[1],
+            generated_batch_size,
+            generated_num_frame,
             self.num_frame_per_block,
             uniform_timestep=True
         )
@@ -345,7 +348,7 @@ class DMD(SelfForcingModel):
             generated_image.flatten(0, 1),
             critic_noise.flatten(0, 1),
             critic_timestep.flatten(0, 1)
-        ).unflatten(0, image_or_video_shape[:2])
+        ).unflatten(0, (generated_batch_size, generated_num_frame))
 
         _, pred_fake_image = self.fake_score(
             noisy_image_or_video=noisy_generated_image,
@@ -369,7 +372,7 @@ class DMD(SelfForcingModel):
                 x0=pred_fake_image.flatten(0, 1),
                 xt=noisy_generated_image.flatten(0, 1),
                 timestep=critic_timestep.flatten(0, 1)
-            ).unflatten(0, image_or_video_shape[:2])
+            ).unflatten(0, (generated_batch_size, generated_num_frame))
 
         denoising_loss = self.denoising_loss_func(
             x=generated_image.flatten(0, 1),
