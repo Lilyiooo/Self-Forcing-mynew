@@ -135,7 +135,7 @@ class CausalWanSelfAttention(nn.Module):
                 roped_query = torch.cat(roped_query, dim=1)
                 roped_key = torch.cat(roped_key, dim=1)
                 if hasattr(self, "_kv_capture_list"):
-                    self._kv_capture_list.append((roped_key.detach(), v.detach()))
+                    self._kv_capture_list.append((k.detach(), v.detach()))
                 if hasattr(self, "_attn_distill_capture_list"):
                     self._attn_distill_capture_list.append(
                         (roped_query.detach(), roped_key.detach(), v.detach())
@@ -172,7 +172,7 @@ class CausalWanSelfAttention(nn.Module):
                 roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
                 roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
                 if hasattr(self, "_kv_capture_list"):
-                    self._kv_capture_list.append((roped_key.detach(), v.detach()))
+                    self._kv_capture_list.append((k.detach(), v.detach()))
                 if hasattr(self, "_attn_distill_capture_list"):
                     self._attn_distill_capture_list.append(
                         (roped_query.detach(), roped_key.detach(), v.detach())
@@ -212,7 +212,7 @@ class CausalWanSelfAttention(nn.Module):
             roped_key = causal_rope_apply(
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
             if hasattr(self, "_kv_capture_list"):
-                self._kv_capture_list.append((roped_key.detach(), v.detach()))
+                self._kv_capture_list.append((k.detach(), v.detach()))
             if hasattr(self, "_attn_distill_capture_list"):
                 self._attn_distill_capture_list.append(
                     (roped_query.detach(), roped_key.detach(), v.detach())

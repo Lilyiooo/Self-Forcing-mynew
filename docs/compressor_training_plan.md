@@ -1,51 +1,57 @@
 # Compressor Training Plan
 
-Current cache experiments use per-layer compressed KV, but the main baseline
-configs keep:
+Current PackForcing-style experiments use per-layer compressed KV. Main DMD
+training still keeps:
 
 ```yaml
 compressor_training:
-  pretrain_epochs: 0
   lambda_recon: 0.0
   end_to_end: false
 ```
 
-That means the compressor participates in forward/inference but is not
-attention-trained in the main runs.
+So the compressor is trained only by explicit pretrain stages before the main
+training loop. This is intentional until the end-to-end path matches real cache
+semantics.
 
-## Current Pretrain Coverage
+## Implemented
 
-`Trainer.pretrain_compressor()` trains:
+`Trainer.pretrain_compressor()` provides a weak reconstruction warmup for the
+HR heads/decoders and a non-degenerate regularizer for all per-layer
+`kv_k_proj` / `kv_v_proj`.
 
-- HR heads and HR decoders with latent reconstruction.
-- All per-layer `kv_k_proj` / `kv_v_proj` with a non-degenerate variance
-  regularizer.
+`Trainer.pretrain_compressor_kv_distill()` now provides representation
+pretraining for:
 
-It still does not train:
-
-- LR branch / VAE fusion through the main compressor forward.
-- `proj` fusion from HR+LR tokens.
-- Per-layer compressed KV to match the transformer's real per-layer K/V space.
-
-So this is only a weak lower-bound pretrain. It can make parts of the
-compressor less random, but it is not PackForcing-style attention alignment.
-
-## Next Representation Step
-
-Add a KV distillation pretrain:
-
-1. Run a clean latent block through the base generator attention path and
-   capture each layer's full-resolution K/V teacher.
-2. Run the same latent block through `HeterogeneousCompressor.forward()`.
-3. Run `project_to_kv()` to get per-layer compressed K/V.
-4. Pool or sample each teacher K/V to the compressed token grid.
-5. Optimize MSE/cosine loss over every layer's compressed K/V.
-
-This directly trains:
-
-- compressor encoder,
-- HR/LR fusion projection,
+- compressor encoder/fusion path,
+- HR/LR projection path,
 - every per-layer `kv_k_proj` / `kv_v_proj`.
 
-Only after this representation line is stable should old `end_to_end=true` be
-revisited, and only if the differentiable path matches real cache semantics.
+It uses two aligned objectives:
+
+1. **Unroped KV distillation**: capture raw normalized teacher K before RoPE and
+   V from each self-attention layer, pool them to the compressed grid, and match
+   unroped student compressed K/V with MSE plus cosine loss.
+2. **Optional attention-output distillation**: capture roped teacher Q/K/V,
+   apply the same temporal-only RoPE used by inference to student compressed K,
+   and match sampled `Attn(Q, K, V)` outputs. Enable with:
+
+```yaml
+compressor_training:
+  kv_distill_attn_output_weight: 0.1
+  kv_distill_attn_query_tokens: 128
+  kv_distill_attn_max_layers: 8
+```
+
+The split is important: KV MSE does not force temporal-only student K to fit a
+full spatial+temporal RoPE teacher target, while attention-output distillation
+still trains the representation in the roped attention space used at inference.
+
+## Remaining Work
+
+- Move distillation data from random Gaussian latent blocks toward generated or
+  denoised rollout latents.
+- Re-evaluate `cachepath`, `mideviction`, and DCS with the stronger compressor.
+- Implement query-affinity DCS after compressed KV quality is stable.
+- Revisit end-to-end compressor fine-tuning only with a real-cache path:
+  `[sink | selected_mid | recent]`, bounded archive, RoPE adjustment, and the
+  same active-mid selection used at inference.

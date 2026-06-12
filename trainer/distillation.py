@@ -516,11 +516,11 @@ class Trainer:
                 timestep = torch.zeros(
                     batch_size, latent_t, device=self.device, dtype=torch.int64
                 )
-                captured = []
+                captured_kv = []
+                captured_attn = []
+                self._set_kv_capture(captured_kv)
                 if attn_output_weight > 0:
-                    self._set_attn_distill_capture(captured)
-                else:
-                    self._set_kv_capture(captured)
+                    self._set_attn_distill_capture(captured_attn)
                 try:
                     self.model.generator(
                         noisy_image_or_video=z_btc,
@@ -540,7 +540,7 @@ class Trainer:
             target_grid = self.compressor.compressed_grid_shape(
                 density_level, (latent_t, latent_h, latent_w)
             )
-            student_kv = [
+            student_roped_kv = [
                 torch.stack([
                     apply_temporal_rope_to_unrotated(
                         kv[0],
@@ -556,14 +556,10 @@ class Trainer:
 
             full_grid = (latent_t, latent_h // 2, latent_w // 2)
             loss = torch.tensor(0.0, device=self.device)
-            used_layers = min(len(captured), num_layers)
+            used_layers = min(len(captured_kv), num_layers)
             attn_layer_ids = set(self._select_distill_layers(used_layers, attn_max_layers))
-            for layer_idx, captured_item in enumerate(captured[:used_layers]):
-                if attn_output_weight > 0:
-                    teacher_q, teacher_k, teacher_v = captured_item
-                else:
-                    teacher_k, teacher_v = captured_item
-                    teacher_q = None
+            for layer_idx, captured_item in enumerate(captured_kv[:used_layers]):
+                teacher_k, teacher_v = captured_item
                 target_k = self._pool_teacher_kv_to_grid(teacher_k, full_grid, target_grid)
                 target_v = self._pool_teacher_kv_to_grid(teacher_v, full_grid, target_grid)
                 pred_k, pred_v = student_kv[layer_idx][0], student_kv[layer_idx][1]
@@ -573,13 +569,18 @@ class Trainer:
                     1 - F.cosine_similarity(pred_k.float(), target_k.float(), dim=-1).mean()
                     + 1 - F.cosine_similarity(pred_v.float(), target_v.float(), dim=-1).mean()
                 )
-                if attn_output_weight > 0 and layer_idx in attn_layer_ids:
+                if (
+                    attn_output_weight > 0
+                    and layer_idx in attn_layer_ids
+                    and layer_idx < len(captured_attn)
+                ):
+                    teacher_q, teacher_roped_k, teacher_attn_v = captured_attn[layer_idx]
                     layer_loss = layer_loss + attn_output_weight * self._attention_output_distill_loss(
                         teacher_q,
-                        teacher_k,
-                        teacher_v,
-                        pred_k,
-                        pred_v,
+                        teacher_roped_k,
+                        teacher_attn_v,
+                        student_roped_kv[layer_idx][0],
+                        student_roped_kv[layer_idx][1],
                         num_query_tokens=attn_query_tokens,
                     )
                 loss = loss + layer_loss
