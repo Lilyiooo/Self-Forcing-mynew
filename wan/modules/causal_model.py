@@ -134,6 +134,12 @@ class CausalWanSelfAttention(nn.Module):
 
                 roped_query = torch.cat(roped_query, dim=1)
                 roped_key = torch.cat(roped_key, dim=1)
+                if hasattr(self, "_kv_capture_list"):
+                    self._kv_capture_list.append((roped_key.detach(), v.detach()))
+                if hasattr(self, "_attn_distill_capture_list"):
+                    self._attn_distill_capture_list.append(
+                        (roped_query.detach(), roped_key.detach(), v.detach())
+                    )
 
                 padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
                 padded_roped_query = torch.cat(
@@ -165,6 +171,12 @@ class CausalWanSelfAttention(nn.Module):
             else:
                 roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
                 roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
+                if hasattr(self, "_kv_capture_list"):
+                    self._kv_capture_list.append((roped_key.detach(), v.detach()))
+                if hasattr(self, "_attn_distill_capture_list"):
+                    self._attn_distill_capture_list.append(
+                        (roped_query.detach(), roped_key.detach(), v.detach())
+                    )
 
                 padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
                 padded_roped_query = torch.cat(
@@ -199,6 +211,12 @@ class CausalWanSelfAttention(nn.Module):
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
             roped_key = causal_rope_apply(
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+            if hasattr(self, "_kv_capture_list"):
+                self._kv_capture_list.append((roped_key.detach(), v.detach()))
+            if hasattr(self, "_attn_distill_capture_list"):
+                self._attn_distill_capture_list.append(
+                    (roped_query.detach(), roped_key.detach(), v.detach())
+                )
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen

@@ -57,6 +57,7 @@ class DMD(SelfForcingModel):
                 vae=self.vae,
                 d_model=d_model,
                 in_ch=in_ch,
+                num_layers=getattr(self.generator.model, 'num_layers', 30),
             )
             print(f"[DMD] Heterogeneous cache enabled: d_model={d_model}, compressor initialized")
 

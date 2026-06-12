@@ -21,6 +21,7 @@ from einops import rearrange
 # Heterogeneous cache imports
 from model.density_estimator import DensityEstimator
 from model.compress import HeterogeneousCompressor
+from utils.rope_utils import apply_temporal_rope_to_unrotated
 
 
 class Trainer:
@@ -320,13 +321,17 @@ class Trainer:
                 # KV projection warmup: ensure kv_k_proj/kv_v_proj produce
                 # non-degenerate output (not all zeros / all same)
                 B_c, N_c, D_c = compressed.shape
-                k_out = self.compressor.kv_k_proj(compressed)
-                v_out = self.compressor.kv_v_proj(compressed)
-                # Regularize: output should have unit variance per feature dim
-                total_loss = total_loss + 0.01 * (
-                    (k_out.var(dim=-1).mean() - 1.0).pow(2)
-                    + (v_out.var(dim=-1).mean() - 1.0).pow(2)
-                )
+                kv_reg = torch.tensor(0.0, device=self.device)
+                for k_proj, v_proj in zip(self.compressor.kv_k_proj, self.compressor.kv_v_proj):
+                    k_out = k_proj(compressed)
+                    v_out = v_proj(compressed)
+                    kv_reg = kv_reg + (
+                        (k_out.var(dim=-1).mean() - 1.0).pow(2)
+                        + (v_out.var(dim=-1).mean() - 1.0).pow(2)
+                    )
+                # Regularize: every per-layer KV projection should produce
+                # non-degenerate output. This is not KV distillation yet.
+                total_loss = total_loss + 0.01 * kv_reg / max(1, len(self.compressor.kv_k_proj))
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -360,6 +365,245 @@ class Trainer:
         else:
             if self.is_main_process:
                 print("Compressor pretraining complete. Decoders kept for joint training.")
+
+    def _unwrap_generator(self):
+        return self.model.generator.module if hasattr(self.model.generator, "module") else self.model.generator
+
+    def _pool_teacher_kv_to_grid(self, teacher_kv, full_grid_shape, target_grid_shape):
+        """Pool full-resolution per-layer KV to the compressed token grid."""
+        batch_size, num_tokens, num_heads, head_dim = teacher_kv.shape
+        frames, height, width = full_grid_shape
+        assert num_tokens == frames * height * width, (
+            f"teacher token mismatch: {num_tokens} != {full_grid_shape}"
+        )
+        x = teacher_kv.reshape(batch_size, frames, height, width, num_heads, head_dim)
+        x = x.permute(0, 4, 5, 1, 2, 3).reshape(
+            batch_size, num_heads * head_dim, frames, height, width
+        )
+        x = F.adaptive_avg_pool3d(x.float(), output_size=target_grid_shape)
+        out_t, out_h, out_w = target_grid_shape
+        x = x.reshape(batch_size, num_heads, head_dim, out_t, out_h, out_w)
+        return x.permute(0, 3, 4, 5, 1, 2).reshape(
+            batch_size, out_t * out_h * out_w, num_heads, head_dim
+        ).to(teacher_kv.dtype)
+
+    def _set_kv_capture(self, capture_list):
+        generator = self._unwrap_generator()
+        for block in generator.model.blocks:
+            block.self_attn._kv_capture_list = capture_list
+
+    def _clear_kv_capture(self):
+        generator = self._unwrap_generator()
+        for block in generator.model.blocks:
+            if hasattr(block.self_attn, "_kv_capture_list"):
+                delattr(block.self_attn, "_kv_capture_list")
+
+    def _set_attn_distill_capture(self, capture_list):
+        generator = self._unwrap_generator()
+        for block in generator.model.blocks:
+            block.self_attn._attn_distill_capture_list = capture_list
+
+    def _clear_attn_distill_capture(self):
+        generator = self._unwrap_generator()
+        for block in generator.model.blocks:
+            if hasattr(block.self_attn, "_attn_distill_capture_list"):
+                delattr(block.self_attn, "_attn_distill_capture_list")
+
+    def _select_distill_layers(self, used_layers: int, max_layers: int):
+        if max_layers <= 0 or max_layers >= used_layers:
+            return list(range(used_layers))
+        if max_layers == 1:
+            return [used_layers - 1]
+        return torch.linspace(0, used_layers - 1, steps=max_layers).round().long().unique().tolist()
+
+    def _attention_output_distill_loss(
+        self,
+        query,
+        teacher_k,
+        teacher_v,
+        student_k,
+        student_v,
+        num_query_tokens: int,
+    ):
+        """Match Attn(Q, compressed K/V) to Attn(Q, full K/V) on sampled queries."""
+        num_tokens = query.shape[1]
+        if num_tokens > num_query_tokens:
+            indices = torch.linspace(
+                0, num_tokens - 1, steps=num_query_tokens,
+                device=query.device,
+            ).round().long()
+            query = query.index_select(1, indices)
+
+        q = query.detach().transpose(1, 2).float()
+        teacher_k_t = teacher_k.detach().transpose(1, 2).float()
+        teacher_v_t = teacher_v.detach().transpose(1, 2).float()
+        student_k_t = student_k.transpose(1, 2).float()
+        student_v_t = student_v.transpose(1, 2).float()
+
+        with torch.no_grad():
+            teacher_out = F.scaled_dot_product_attention(
+                q, teacher_k_t, teacher_v_t, dropout_p=0.0, is_causal=False
+            )
+        student_out = F.scaled_dot_product_attention(
+            q, student_k_t, student_v_t, dropout_p=0.0, is_causal=False
+        )
+        teacher_out = teacher_out.transpose(1, 2)
+        student_out = student_out.transpose(1, 2)
+        loss = F.mse_loss(student_out, teacher_out)
+        loss = loss + (1 - F.cosine_similarity(
+            student_out.flatten(2),
+            teacher_out.flatten(2),
+            dim=-1,
+        ).mean())
+        return loss
+
+    def pretrain_compressor_kv_distill(self, num_steps=0):
+        """Distill compressed per-layer KV toward pooled full-resolution teacher KV."""
+        if num_steps <= 0 or not self.heterogeneous_cache_enabled or self.compressor is None:
+            return
+
+        if self.is_main_process:
+            print("Starting compressor KV distillation pretrain...")
+
+        generator = self._unwrap_generator()
+        generator_model = generator.model
+        num_layers = getattr(generator_model, "num_layers", len(generator_model.blocks))
+        num_heads = getattr(generator_model, "num_heads", 12)
+
+        for param in self.model.generator.parameters():
+            param.requires_grad_(False)
+        for param in self.model.text_encoder.parameters():
+            param.requires_grad_(False)
+        for name, param in self.compressor.named_parameters():
+            param.requires_grad_(False if ".vae." in name or "decoder_" in name else True)
+
+        compressor_train_cfg = getattr(self.config, "compressor_training", None) or OmegaConf.create({})
+        optimizer = torch.optim.AdamW(
+            [p for p in self.compressor.parameters() if p.requires_grad],
+            lr=getattr(compressor_train_cfg, "kv_distill_lr", 1e-4),
+        )
+        batch_size = getattr(compressor_train_cfg, "kv_distill_batch_size", 1)
+        latent_t = getattr(
+            compressor_train_cfg,
+            "kv_distill_latent_T",
+            getattr(self.config, "num_frame_per_block", 4),
+        )
+        latent_h = getattr(compressor_train_cfg, "kv_distill_latent_H", 60)
+        latent_w = getattr(compressor_train_cfg, "kv_distill_latent_W", 104)
+        in_ch = getattr(getattr(self.config, "compressor", None), "in_ch", 16)
+        density_level = getattr(compressor_train_cfg, "kv_distill_density_level", "mid")
+        cosine_weight = getattr(compressor_train_cfg, "kv_distill_cosine_weight", 0.1)
+        attn_output_weight = getattr(compressor_train_cfg, "kv_distill_attn_output_weight", 0.0)
+        attn_query_tokens = getattr(compressor_train_cfg, "kv_distill_attn_query_tokens", 128)
+        attn_max_layers = getattr(compressor_train_cfg, "kv_distill_attn_max_layers", 8)
+
+        if self.is_main_process:
+            print(
+                f"  KV distill latent shape: (B={batch_size}, C={in_ch}, "
+                f"T={latent_t}, H={latent_h}, W={latent_w}), steps={num_steps}"
+            )
+
+        self.compressor.train()
+        for step_idx in range(num_steps):
+            z_c_first = torch.randn(
+                batch_size, in_ch, latent_t, latent_h, latent_w,
+                device=self.device, dtype=self.dtype,
+            )
+            z_btc = z_c_first.permute(0, 2, 1, 3, 4).contiguous()
+
+            with torch.no_grad():
+                conditional_dict = self.model.text_encoder(text_prompts=[""] * batch_size)
+                timestep = torch.zeros(
+                    batch_size, latent_t, device=self.device, dtype=torch.int64
+                )
+                captured = []
+                if attn_output_weight > 0:
+                    self._set_attn_distill_capture(captured)
+                else:
+                    self._set_kv_capture(captured)
+                try:
+                    self.model.generator(
+                        noisy_image_or_video=z_btc,
+                        conditional_dict=conditional_dict,
+                        timestep=timestep,
+                    )
+                finally:
+                    self._clear_kv_capture()
+                    self._clear_attn_distill_capture()
+
+            compressed_tokens, _ = self.compressor(z_c_first, density_level)
+            student_kv = self.compressor.project_to_kv(
+                compressed_tokens,
+                num_layers=num_layers,
+                num_heads=num_heads,
+            )
+            target_grid = self.compressor.compressed_grid_shape(
+                density_level, (latent_t, latent_h, latent_w)
+            )
+            student_kv = [
+                torch.stack([
+                    apply_temporal_rope_to_unrotated(
+                        kv[0],
+                        freqs=generator_model.freqs,
+                        start_frame=0,
+                        grid_shape=target_grid,
+                        temporal_stride=2,
+                    ),
+                    kv[1],
+                ], dim=0)
+                for kv in student_kv
+            ]
+
+            full_grid = (latent_t, latent_h // 2, latent_w // 2)
+            loss = torch.tensor(0.0, device=self.device)
+            used_layers = min(len(captured), num_layers)
+            attn_layer_ids = set(self._select_distill_layers(used_layers, attn_max_layers))
+            for layer_idx, captured_item in enumerate(captured[:used_layers]):
+                if attn_output_weight > 0:
+                    teacher_q, teacher_k, teacher_v = captured_item
+                else:
+                    teacher_k, teacher_v = captured_item
+                    teacher_q = None
+                target_k = self._pool_teacher_kv_to_grid(teacher_k, full_grid, target_grid)
+                target_v = self._pool_teacher_kv_to_grid(teacher_v, full_grid, target_grid)
+                pred_k, pred_v = student_kv[layer_idx][0], student_kv[layer_idx][1]
+                layer_loss = F.mse_loss(pred_k.float(), target_k.float())
+                layer_loss = layer_loss + F.mse_loss(pred_v.float(), target_v.float())
+                layer_loss = layer_loss + cosine_weight * (
+                    1 - F.cosine_similarity(pred_k.float(), target_k.float(), dim=-1).mean()
+                    + 1 - F.cosine_similarity(pred_v.float(), target_v.float(), dim=-1).mean()
+                )
+                if attn_output_weight > 0 and layer_idx in attn_layer_ids:
+                    layer_loss = layer_loss + attn_output_weight * self._attention_output_distill_loss(
+                        teacher_q,
+                        teacher_k,
+                        teacher_v,
+                        pred_k,
+                        pred_v,
+                        num_query_tokens=attn_query_tokens,
+                    )
+                loss = loss + layer_loss
+            loss = loss / max(1, used_layers)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.compressor.parameters() if p.requires_grad], max_norm=1.0
+            )
+            optimizer.step()
+
+            if step_idx % 10 == 0 and self.is_main_process:
+                print(f"  KV distill step {step_idx}/{num_steps}, loss={loss.item():.6f}")
+
+        for param in self.model.generator.parameters():
+            param.requires_grad_(True)
+        for param in self.model.text_encoder.parameters():
+            param.requires_grad_(True)
+        for param in self.compressor.parameters():
+            param.requires_grad_(True)
+        self.compressor.to(dtype=self.dtype)
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _compute_reconstruction_loss(self, pred_image):
         """
@@ -672,6 +916,8 @@ class Trainer:
             compressor_cfg = getattr(self.config, "compressor_training", None)
             pretrain_steps = getattr(compressor_cfg, "pretrain_epochs", 5) * 20  # approximate
             self.pretrain_compressor(num_steps=pretrain_steps)
+            kv_distill_steps = getattr(compressor_cfg, "kv_distill_steps", 0)
+            self.pretrain_compressor_kv_distill(num_steps=kv_distill_steps)
 
         while True:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
@@ -718,7 +964,7 @@ class Trainer:
                 torch.cuda.empty_cache()
                 self.save()
                 torch.cuda.empty_cache()
-                if not reached_max_train_steps:
+                if not reached_max_train_steps and getattr(self.config, "validate_on_save", True):
                     self.validate()
 
             # Logging

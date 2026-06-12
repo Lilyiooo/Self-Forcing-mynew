@@ -117,6 +117,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 vae=self.vae,
                 d_model=self.model_dim,
                 in_ch=in_ch,
+                num_layers=self.model_num_layers,
             )
 
         if device is not None or dtype is not None:
@@ -447,6 +448,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 vae=self.vae,
                 d_model=d_model,
                 in_ch=in_ch,
+                num_layers=self.model_num_layers,
             ).to(device=device, dtype=dtype)
         else:
             self.compressor = self.compressor.to(device=device, dtype=dtype)
@@ -467,6 +469,7 @@ class CausalInferencePipeline(torch.nn.Module):
             eviction_policy=getattr(het_cfg, "eviction_policy", "density"),
             top_k_enabled=self.top_k_enabled,
             top_k_blocks=self.top_k_blocks,
+            mid_archive_capacity_blocks=getattr(het_cfg, "mid_archive_capacity_blocks", 64),
         )
         if self.cache_debug_logger is not None:
             self.het_kv_cache.set_debug_logger(self.cache_debug_logger)

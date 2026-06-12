@@ -48,6 +48,7 @@ class HeterogeneousKVCache:
         eviction_policy: str = "density",
         top_k_enabled: bool = False,
         top_k_blocks: int = 8,
+        mid_archive_capacity_blocks: int = 64,
     ):
         self.batch_size = batch_size
         self.num_transformer_blocks = num_transformer_blocks
@@ -65,6 +66,7 @@ class HeterogeneousKVCache:
         self.debug_logger = None
         self.top_k_enabled = top_k_enabled
         self.top_k_blocks = top_k_blocks
+        self.mid_archive_capacity_blocks = mid_archive_capacity_blocks
         self._next_block_id = 0
         self._last_logged_selection = None
 
@@ -116,6 +118,9 @@ class HeterogeneousKVCache:
     def _record_debug_event(self, event: str, **fields) -> None:
         if self.debug_logger is not None:
             self.debug_logger.log(event, **fields)
+
+    def _archive_total_tokens(self) -> int:
+        return sum(meta.n_tokens for meta in self.mid_meta)
 
     def _new_meta(
         self,
@@ -186,6 +191,7 @@ class HeterogeneousKVCache:
                 )
                 self.mid_meta.append(meta)
                 self.mid_archive_kv.append([kvc.detach().clone() for kvc in kv_compressed])
+                self._evict_archive_blocks_if_needed()
                 self.mid_token_count = self._selected_mid_token_count()
                 self._record_debug_event(
                     "mid_archive_insert",
@@ -198,6 +204,8 @@ class HeterogeneousKVCache:
                     block_start=temporal_position,
                     block_end=temporal_position + n_frames,
                     archive_blocks=len(self.mid_meta),
+                    archive_total_tokens=self._archive_total_tokens(),
+                    active_mid_blocks=len(self._selected_archive_indices()),
                     active_mid_token_count=self.mid_token_count,
                     rope_delta_frames=self.rope_delta_frames,
                 )
@@ -258,6 +266,7 @@ class HeterogeneousKVCache:
                 self.mid_archive_kv.append(
                     [kv_compressed.detach().clone() for _ in range(self.num_transformer_blocks)]
                 )
+                self._evict_archive_blocks_if_needed()
                 self.mid_token_count = self._selected_mid_token_count()
                 self._record_debug_event(
                     "mid_archive_insert",
@@ -270,6 +279,8 @@ class HeterogeneousKVCache:
                     block_start=temporal_position,
                     block_end=temporal_position + n_frames,
                     archive_blocks=len(self.mid_meta),
+                    archive_total_tokens=self._archive_total_tokens(),
+                    active_mid_blocks=len(self._selected_archive_indices()),
                     active_mid_token_count=self.mid_token_count,
                     rope_delta_frames=self.rope_delta_frames,
                 )
@@ -372,6 +383,34 @@ class HeterogeneousKVCache:
             len_mid_meta=len(self.mid_meta),
         )
 
+    def _evict_archive_blocks_if_needed(self) -> None:
+        if not self.top_k_enabled:
+            return
+        if self.mid_archive_capacity_blocks <= 0:
+            return
+        while len(self.mid_meta) > self.mid_archive_capacity_blocks:
+            self._evict_archive_block(0)
+
+    def _evict_archive_block(self, evict_idx: int) -> None:
+        if not self.mid_meta:
+            return
+        evicted = self.mid_meta.pop(evict_idx)
+        self.mid_archive_kv.pop(evict_idx)
+        if self.eviction_policy == "fifo":
+            self.rope_delta_frames += evicted.n_frames
+        self._last_logged_selection = None
+        self._record_debug_event(
+            "mid_archive_evict",
+            eviction_policy=self.eviction_policy,
+            evicted_block_id=evicted.block_id,
+            evicted_temporal_position=evicted.temporal_position,
+            evicted_n_frames=evicted.n_frames,
+            evicted_n_tokens=evicted.n_tokens,
+            updated_rope_delta_frames=self.rope_delta_frames,
+            archive_blocks=len(self.mid_meta),
+            archive_total_tokens=self._archive_total_tokens(),
+        )
+
     def get_mid_kv(self, layer_idx: int = 0) -> Optional[torch.Tensor]:
         """
         Return the current mid buffer KV for a specific layer.
@@ -395,6 +434,10 @@ class HeterogeneousKVCache:
                             self.mid_meta[i].temporal_position for i in selected
                         ],
                         selected_n_tokens=[self.mid_meta[i].n_tokens for i in selected],
+                        archive_blocks=len(self.mid_meta),
+                        archive_total_tokens=self._archive_total_tokens(),
+                        active_mid_blocks=len(selected),
+                        active_mid_tokens=sum(self.mid_meta[i].n_tokens for i in selected),
                     )
             kv = torch.cat([self.mid_archive_kv[i][layer_idx] for i in selected], dim=2)
             self.mid_token_count = kv.shape[2]

@@ -138,6 +138,7 @@ class PackForcingTrainingPipeline:
             eviction_policy=getattr(self.het_cache_config, "eviction_policy", "density"),
             top_k_enabled=self.top_k_enabled,
             top_k_blocks=self.top_k_blocks,
+            mid_archive_capacity_blocks=getattr(self.het_cache_config, "mid_archive_capacity_blocks", 64),
         )
         if self.cache_debug_logger is not None:
             self.het_kv_cache.set_debug_logger(self.cache_debug_logger)

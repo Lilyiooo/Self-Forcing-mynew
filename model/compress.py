@@ -275,8 +275,10 @@ class HeterogeneousCompressor(nn.Module):
         vae,
         d_model: int = 2048,
         in_ch: int = 16,
+        num_layers: int = 30,
     ):
         super().__init__()
+        self.num_layers = num_layers
         # Three HR heads (trainable)
         self.hr_high = HRHead8x(in_ch, d_model)
         self.hr_mid  = HRHead32x(in_ch, d_model)
@@ -295,11 +297,14 @@ class HeterogeneousCompressor(nn.Module):
         # HR + LR concat projection to d_model
         self.proj = nn.Linear(d_model * 2, d_model)
 
-        # KV projection heads: project compressed tokens to K and V for attention
-        # Shared across all transformer layers (each layer's attention produces
-        # different queries, so per-layer K/V specialization is not strictly needed)
-        self.kv_k_proj = nn.Linear(d_model, d_model)
-        self.kv_v_proj = nn.Linear(d_model, d_model)
+        # KV projection heads: each transformer layer has its own compressed
+        # K/V projection, matching normal layer-specific attention cache semantics.
+        self.kv_k_proj = nn.ModuleList([
+            nn.Linear(d_model, d_model) for _ in range(num_layers)
+        ])
+        self.kv_v_proj = nn.ModuleList([
+            nn.Linear(d_model, d_model) for _ in range(num_layers)
+        ])
 
         # Validate output token counts with a dummy input
         self._validated = False
@@ -376,13 +381,41 @@ class HeterogeneousCompressor(nn.Module):
     def project_to_kv(self, compressed_tokens, num_layers, num_heads):
         """
         Project compressed tokens to per-layer KV pairs for attention.
-        Uses learned k_proj and v_proj (shared across layers).
+        Uses learned layer-specific k_proj and v_proj.
         compressed_tokens: (B, N, D)
         Returns: list of (2, B, N, num_heads, head_dim) per layer
         """
         B, N, D = compressed_tokens.shape
         head_dim = D // num_heads
-        k = self.kv_k_proj(compressed_tokens).view(B, N, num_heads, head_dim)
-        v = self.kv_v_proj(compressed_tokens).view(B, N, num_heads, head_dim)
-        kv = torch.stack([k, v], dim=0)  # (2, B, N, num_heads, head_dim)
-        return [kv] * num_layers
+        if num_layers > len(self.kv_k_proj):
+            raise ValueError(
+                f"requested num_layers={num_layers}, but compressor only has "
+                f"{len(self.kv_k_proj)} KV projection layers"
+            )
+        out = []
+        for layer_idx in range(num_layers):
+            k = self.kv_k_proj[layer_idx](compressed_tokens).view(B, N, num_heads, head_dim)
+            v = self.kv_v_proj[layer_idx](compressed_tokens).view(B, N, num_heads, head_dim)
+            out.append(torch.stack([k, v], dim=0))
+        return out
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Load current or legacy shared-KV checkpoints.
+
+        Older checkpoints used one shared kv_k_proj/kv_v_proj for every
+        transformer layer. Expand those weights into all per-layer projections
+        so existing checkpoints remain usable for inference or finetuning.
+        """
+        if "kv_k_proj.weight" in state_dict and "kv_v_proj.weight" in state_dict:
+            state_dict = dict(state_dict)
+            for layer_idx in range(self.num_layers):
+                for prefix in ("kv_k_proj", "kv_v_proj"):
+                    for suffix in ("weight", "bias"):
+                        old_key = f"{prefix}.{suffix}"
+                        new_key = f"{prefix}.{layer_idx}.{suffix}"
+                        if old_key in state_dict and new_key not in state_dict:
+                            state_dict[new_key] = state_dict[old_key].clone()
+            for prefix in ("kv_k_proj", "kv_v_proj"):
+                for suffix in ("weight", "bias"):
+                    state_dict.pop(f"{prefix}.{suffix}", None)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)

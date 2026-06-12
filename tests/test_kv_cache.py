@@ -35,7 +35,7 @@ class HeterogeneousKVCacheTest(unittest.TestCase):
             eviction_policy=eviction_policy,
         )
 
-    def _make_topk_cache(self, top_k_blocks=2):
+    def _make_topk_cache(self, top_k_blocks=2, archive_capacity=64):
         HeterogeneousKVCache = load_kv_cache_class()
         return HeterogeneousKVCache(
             batch_size=1,
@@ -48,6 +48,7 @@ class HeterogeneousKVCacheTest(unittest.TestCase):
             eviction_policy="fifo",
             top_k_enabled=True,
             top_k_blocks=top_k_blocks,
+            mid_archive_capacity_blocks=archive_capacity,
         )
 
     def test_fifo_eviction_removes_oldest_and_tracks_delta(self):
@@ -124,6 +125,30 @@ class HeterogeneousKVCacheTest(unittest.TestCase):
         self.assertTrue(torch.equal(selected[:, :, :3], second))
         self.assertTrue(torch.equal(selected[:, :, 3:], third))
         self.assertEqual(cache.mid_token_count, 6)
+
+    def test_topk_archive_capacity_evicts_oldest_and_tracks_delta(self):
+        cache = self._make_topk_cache(top_k_blocks=2, archive_capacity=2)
+        logger = ListLogger()
+        cache.set_debug_logger(logger)
+
+        first = torch.ones(2, 1, 3, 2, 4)
+        second = torch.ones(2, 1, 3, 2, 4) * 2
+        third = torch.ones(2, 1, 3, 2, 4) * 3
+        cache.push_mid_block(first, "mid", 0.8, temporal_position=8, n_frames=4)
+        cache.push_mid_block(second, "mid", 0.7, temporal_position=12, n_frames=4)
+        cache.push_mid_block(third, "mid", 0.6, temporal_position=16, n_frames=4)
+
+        self.assertEqual([meta.temporal_position for meta in cache.mid_meta], [12, 16])
+        self.assertEqual(cache.rope_delta_frames, 4)
+        selected = cache.get_mid_kv(0)
+        self.assertTrue(torch.equal(selected[:, :, :3], second))
+        self.assertTrue(torch.equal(selected[:, :, 3:], third))
+
+        events = [record["event"] for record in logger.records]
+        self.assertIn("mid_archive_evict", events)
+        evict = [record for record in logger.records if record["event"] == "mid_archive_evict"][0]
+        self.assertEqual(evict["evicted_temporal_position"], 8)
+        self.assertEqual(evict["archive_blocks"], 2)
 
 
 if __name__ == "__main__":
