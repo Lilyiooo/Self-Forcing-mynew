@@ -496,23 +496,54 @@ class Trainer:
         attn_output_weight = getattr(compressor_train_cfg, "kv_distill_attn_output_weight", 0.0)
         attn_query_tokens = getattr(compressor_train_cfg, "kv_distill_attn_query_tokens", 128)
         attn_max_layers = getattr(compressor_train_cfg, "kv_distill_attn_max_layers", 8)
+        latent_source = getattr(compressor_train_cfg, "kv_distill_latent_source", "random")
+        denoise_timestep = getattr(compressor_train_cfg, "kv_distill_denoise_timestep", 750)
 
         if self.is_main_process:
             print(
                 f"  KV distill latent shape: (B={batch_size}, C={in_ch}, "
                 f"T={latent_t}, H={latent_h}, W={latent_w}), steps={num_steps}"
             )
+            print(
+                f"  KV distill source={latent_source}, "
+                f"attn_output_weight={attn_output_weight}"
+            )
 
         self.compressor.train()
         for step_idx in range(num_steps):
-            z_c_first = torch.randn(
-                batch_size, in_ch, latent_t, latent_h, latent_w,
-                device=self.device, dtype=self.dtype,
-            )
-            z_btc = z_c_first.permute(0, 2, 1, 3, 4).contiguous()
-
             with torch.no_grad():
                 conditional_dict = self.model.text_encoder(text_prompts=[""] * batch_size)
+                if latent_source == "random":
+                    z_c_first = torch.randn(
+                        batch_size, in_ch, latent_t, latent_h, latent_w,
+                        device=self.device, dtype=self.dtype,
+                    )
+                    z_btc = z_c_first.permute(0, 2, 1, 3, 4).contiguous()
+                elif latent_source in ("denoised", "rollout"):
+                    noisy_z_btc = torch.randn(
+                        batch_size, latent_t, in_ch, latent_h, latent_w,
+                        device=self.device, dtype=self.dtype,
+                    )
+                    denoise_t = torch.full(
+                        (batch_size, latent_t),
+                        float(denoise_timestep),
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                    _, pred_x0 = self.model.generator(
+                        noisy_image_or_video=noisy_z_btc,
+                        conditional_dict=conditional_dict,
+                        timestep=denoise_t,
+                    )
+                    z_btc = pred_x0.detach()
+                    z_c_first = z_btc.permute(0, 2, 1, 3, 4).contiguous()
+                    del noisy_z_btc, pred_x0
+                else:
+                    raise ValueError(
+                        f"Unsupported kv_distill_latent_source={latent_source!r}; "
+                        "expected 'random', 'denoised', or 'rollout'."
+                    )
+
                 timestep = torch.zeros(
                     batch_size, latent_t, device=self.device, dtype=torch.int64
                 )

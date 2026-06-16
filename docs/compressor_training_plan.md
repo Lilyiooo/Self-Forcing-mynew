@@ -46,10 +46,31 @@ The split is important: KV MSE does not force temporal-only student K to fit a
 full spatial+temporal RoPE teacher target, while attention-output distillation
 still trains the representation in the roped attention space used at inference.
 
+The distillation latent source is configurable:
+
+```yaml
+compressor_training:
+  kv_distill_latent_source: random    # default
+```
+
+The first rollout-like source is:
+
+```yaml
+compressor_training:
+  kv_distill_latent_source: denoised
+  kv_distill_denoise_timestep: 750
+```
+
+This runs the frozen generator on a noisy latent block, uses its predicted
+`x0` as the distillation block, and then applies the same raw-KV and
+attention-output objectives. It is closer to generated clean latent
+distribution than pure Gaussian random blocks, while avoiding full long-video
+cache rollout inside the pretrain loop.
+
 ## Remaining Work
 
-- Move distillation data from random Gaussian latent blocks toward generated or
-  denoised rollout latents.
+- Move distillation data from single-block denoised latents toward generated
+  long-rollout latents with realistic cache history.
 - Re-evaluate `cachepath`, `mideviction`, and DCS with the stronger compressor.
 - Implement query-affinity DCS after compressed KV quality is stable.
 - Revisit end-to-end compressor fine-tuning only with a real-cache path:
