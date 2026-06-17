@@ -457,6 +457,17 @@ class Trainer:
         ).mean())
         return loss
 
+    def _load_kv_distill_prompts(self, prompt_path: str):
+        if not prompt_path:
+            return []
+        try:
+            with open(prompt_path, encoding="utf-8") as f:
+                return [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            if self.is_main_process:
+                print(f"[KV distill] Prompt path not found: {prompt_path}; falling back to empty prompts.")
+            return []
+
     def pretrain_compressor_kv_distill(self, num_steps=0):
         """Distill compressed per-layer KV toward pooled full-resolution teacher KV."""
         if num_steps <= 0 or not self.heterogeneous_cache_enabled or self.compressor is None:
@@ -498,6 +509,10 @@ class Trainer:
         attn_max_layers = getattr(compressor_train_cfg, "kv_distill_attn_max_layers", 8)
         latent_source = getattr(compressor_train_cfg, "kv_distill_latent_source", "random")
         denoise_timestep = getattr(compressor_train_cfg, "kv_distill_denoise_timestep", 750)
+        use_real_prompts = getattr(compressor_train_cfg, "kv_distill_use_real_prompts", False)
+        prompt_path = getattr(compressor_train_cfg, "kv_distill_prompt_path", getattr(self.config, "data_path", ""))
+        prompt_pool = self._load_kv_distill_prompts(prompt_path) if use_real_prompts else []
+        global_rank = dist.get_rank() if dist.is_initialized() else 0
 
         if self.is_main_process:
             print(
@@ -506,13 +521,21 @@ class Trainer:
             )
             print(
                 f"  KV distill source={latent_source}, "
-                f"attn_output_weight={attn_output_weight}"
+                f"attn_output_weight={attn_output_weight}, "
+                f"use_real_prompts={use_real_prompts}, prompt_pool={len(prompt_pool)}"
             )
 
         self.compressor.train()
         for step_idx in range(num_steps):
             with torch.no_grad():
-                conditional_dict = self.model.text_encoder(text_prompts=[""] * batch_size)
+                if prompt_pool:
+                    text_prompts = [
+                        prompt_pool[(step_idx * batch_size + i + global_rank) % len(prompt_pool)]
+                        for i in range(batch_size)
+                    ]
+                else:
+                    text_prompts = [""] * batch_size
+                conditional_dict = self.model.text_encoder(text_prompts=text_prompts)
                 if latent_source == "random":
                     z_c_first = torch.randn(
                         batch_size, in_ch, latent_t, latent_h, latent_w,

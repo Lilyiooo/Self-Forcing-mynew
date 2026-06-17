@@ -67,6 +67,19 @@ attention-output objectives. It is closer to generated clean latent
 distribution than pure Gaussian random blocks, while avoiding full long-video
 cache rollout inside the pretrain loop.
 
+Prompt conditioning can be enabled for this cheap diagnostic:
+
+```yaml
+compressor_training:
+  kv_distill_use_real_prompts: true
+  kv_distill_prompt_path: prompts/vidprom_filtered_extended.txt
+```
+
+This replaces the empty prompt used by early distillation runs with prompts
+sampled from the training prompt file. It tests whether the logic drop from
+single-block denoised distillation is partly caused by missing semantic prompt
+conditioning. It still does not provide AR cache history.
+
 ## Remaining Work
 
 - Move distillation data from single-block denoised latents toward generated
