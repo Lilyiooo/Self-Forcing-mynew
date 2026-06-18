@@ -85,8 +85,9 @@ compressor_training:
   kv_distill_denoise_timestep: 750
   kv_distill_use_real_prompts: true
   kv_distill_prompt_path: prompts/vidprom_filtered_extended.txt
-  kv_distill_rollout_blocks: 4
+  kv_distill_rollout_blocks: 5
   kv_distill_target_block_index: 2
+  kv_distill_future_gap_blocks: 2
   lambda_recon: 0.0
   warmup_steps: 100
   end_to_end: false

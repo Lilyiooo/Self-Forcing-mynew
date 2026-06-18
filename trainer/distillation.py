@@ -515,6 +515,7 @@ class Trainer:
         denoise_timestep: int,
         rollout_blocks: int,
         target_block_index: int,
+        future_gap_blocks: int,
         generator_model,
     ):
         """Generate short AR cache history and return a past block plus future-query captures."""
@@ -535,7 +536,10 @@ class Trainer:
         target_attn = None
         future_attn = None
         current_start_frame = 0
-        future_block_index = min(rollout_blocks - 1, target_block_index + 1)
+        future_block_index = min(
+            rollout_blocks - 1,
+            target_block_index + max(1, int(future_gap_blocks)),
+        )
 
         for block_idx in range(rollout_blocks):
             noisy_z = torch.randn(
@@ -659,9 +663,37 @@ class Trainer:
             "kv_distill_target_block_index",
             max(0, getattr(getattr(self.config, "heterogeneous_cache", None), "Nsink", 8) // max(1, latent_t)),
         )
+        nrecent = getattr(
+            getattr(self.config, "heterogeneous_cache", None),
+            "Nrecent",
+            latent_t,
+        )
+        latent_t_int = max(1, int(latent_t))
+        default_future_gap_blocks = max(
+            1,
+            (int(nrecent) + latent_t_int - 1) // latent_t_int + 1,
+        )
+        future_gap_blocks = getattr(
+            compressor_train_cfg,
+            "kv_distill_future_gap_blocks",
+            default_future_gap_blocks,
+        )
         if latent_source == "ar_rollout":
             rollout_blocks = max(2, int(rollout_blocks))
-            target_block_index = min(max(0, int(target_block_index)), rollout_blocks - 2)
+            future_gap_blocks = max(1, int(future_gap_blocks))
+            target_block_index = max(0, int(target_block_index))
+            rollout_blocks = max(
+                rollout_blocks,
+                target_block_index + future_gap_blocks + 1,
+            )
+            target_block_index = min(target_block_index, rollout_blocks - 2)
+            future_block_index = min(
+                rollout_blocks - 1,
+                target_block_index + future_gap_blocks,
+            )
+        else:
+            future_gap_blocks = max(1, int(future_gap_blocks))
+            future_block_index = None
         global_rank = dist.get_rank() if dist.is_initialized() else 0
 
         if self.is_main_process:
@@ -673,7 +705,8 @@ class Trainer:
                 f"  KV distill source={latent_source}, "
                 f"attn_output_weight={attn_output_weight}, "
                 f"use_real_prompts={use_real_prompts}, prompt_pool={len(prompt_pool)}, "
-                f"rollout_blocks={rollout_blocks}, target_block_index={target_block_index}"
+                f"rollout_blocks={rollout_blocks}, target_block_index={target_block_index}, "
+                f"future_gap_blocks={future_gap_blocks}, future_block_index={future_block_index}"
             )
 
         self.compressor.train()
@@ -740,6 +773,7 @@ class Trainer:
                         denoise_timestep=int(denoise_timestep),
                         rollout_blocks=rollout_blocks,
                         target_block_index=target_block_index,
+                        future_gap_blocks=future_gap_blocks,
                         generator_model=generator_model,
                     )
                     z_btc = None

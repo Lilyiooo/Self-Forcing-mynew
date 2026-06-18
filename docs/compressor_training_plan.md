@@ -75,14 +75,18 @@ The first AR-cache-aware source is:
 ```yaml
 compressor_training:
   kv_distill_latent_source: ar_rollout
-  kv_distill_rollout_blocks: 4
+  kv_distill_rollout_blocks: 5
   kv_distill_target_block_index: 2
+  kv_distill_future_gap_blocks: 2
 ```
 
 It runs a short frozen-generator rollout with a real self-attention KV cache.
 By default it skips the `Nsink=8` sink frames and uses block index 2
-(`start_frame=8`) as the compressed-past target. The attention-output loss then
-uses the following block's query to read the target block:
+(`start_frame=8`) as the compressed-past target. The attention-output loss uses
+a future block query after the target has aged out of the recent window. If
+`kv_distill_future_gap_blocks` is not set, the default gap is
+`ceil(Nrecent / num_frame_per_block) + 1`; for `Nrecent=4` and
+`num_frame_per_block=4`, the future block is `target + 2`.
 
 ```text
 Attn(Q_future, K/V_compressed_past) ~= Attn(Q_future, K/V_full_past)
@@ -90,8 +94,8 @@ Attn(Q_future, K/V_compressed_past) ~= Attn(Q_future, K/V_full_past)
 
 This is still a minimal implementation: it uses a short single-step denoise per
 block rather than the full inference denoising schedule, but it trains the key
-PackForcing behavior that compressed mid blocks are read by future queries under
-real cache state.
+PackForcing behavior that compressed mid blocks, rather than only recent
+full-resolution blocks, are read by future queries under real cache state.
 
 Prompt conditioning can be enabled for this cheap diagnostic:
 
