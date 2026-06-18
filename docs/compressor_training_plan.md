@@ -53,7 +53,7 @@ compressor_training:
   kv_distill_latent_source: random    # default
 ```
 
-The first rollout-like source is:
+The first generated-latent source is single-block denoising:
 
 ```yaml
 compressor_training:
@@ -66,6 +66,32 @@ This runs the frozen generator on a noisy latent block, uses its predicted
 attention-output objectives. It is closer to generated clean latent
 distribution than pure Gaussian random blocks, while avoiding full long-video
 cache rollout inside the pretrain loop.
+
+This is **not** AR-cache rollout. `kv_distill_latent_source: rollout` is not a
+valid source name; use `denoised` for the single-block diagnostic above.
+
+The first AR-cache-aware source is:
+
+```yaml
+compressor_training:
+  kv_distill_latent_source: ar_rollout
+  kv_distill_rollout_blocks: 4
+  kv_distill_target_block_index: 2
+```
+
+It runs a short frozen-generator rollout with a real self-attention KV cache.
+By default it skips the `Nsink=8` sink frames and uses block index 2
+(`start_frame=8`) as the compressed-past target. The attention-output loss then
+uses the following block's query to read the target block:
+
+```text
+Attn(Q_future, K/V_compressed_past) ~= Attn(Q_future, K/V_full_past)
+```
+
+This is still a minimal implementation: it uses a short single-step denoise per
+block rather than the full inference denoising schedule, but it trains the key
+PackForcing behavior that compressed mid blocks are read by future queries under
+real cache state.
 
 Prompt conditioning can be enabled for this cheap diagnostic:
 
@@ -82,8 +108,8 @@ conditioning. It still does not provide AR cache history.
 
 ## Remaining Work
 
-- Move distillation data from single-block denoised latents toward generated
-  long-rollout latents with realistic cache history.
+- Move AR rollout distillation from short single-step rollout toward the full
+  inference denoising schedule and longer cache histories.
 - Re-evaluate `cachepath`, `mideviction`, and DCS with the stronger compressor.
 - Implement query-affinity DCS after compressed KV quality is stable.
 - Revisit end-to-end compressor fine-tuning only with a real-cache path:

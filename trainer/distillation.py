@@ -468,6 +468,146 @@ class Trainer:
                 print(f"[KV distill] Prompt path not found: {prompt_path}; falling back to empty prompts.")
             return []
 
+    def _make_ar_rollout_caches(
+        self,
+        batch_size: int,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        num_tokens: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        kv_cache = []
+        crossattn_cache = []
+        for _ in range(num_layers):
+            kv_cache.append({
+                "k": torch.zeros(
+                    [batch_size, num_tokens, num_heads, head_dim],
+                    device=device, dtype=dtype,
+                ),
+                "v": torch.zeros(
+                    [batch_size, num_tokens, num_heads, head_dim],
+                    device=device, dtype=dtype,
+                ),
+                "global_end_index": torch.tensor([0], device=device, dtype=torch.long),
+                "local_end_index": torch.tensor([0], device=device, dtype=torch.long),
+            })
+            crossattn_cache.append({
+                "k": torch.zeros([batch_size, 512, num_heads, head_dim], device=device, dtype=dtype),
+                "v": torch.zeros([batch_size, 512, num_heads, head_dim], device=device, dtype=dtype),
+                "is_init": False,
+            })
+        return kv_cache, crossattn_cache
+
+    @torch.no_grad()
+    def _sample_ar_rollout_distill_block(
+        self,
+        conditional_dict,
+        batch_size: int,
+        in_ch: int,
+        latent_t: int,
+        latent_h: int,
+        latent_w: int,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        denoise_timestep: int,
+        rollout_blocks: int,
+        target_block_index: int,
+        generator_model,
+    ):
+        """Generate short AR cache history and return a past block plus future-query captures."""
+        frame_seq_length = (latent_h // 2) * (latent_w // 2)
+        cache_tokens = max(1, rollout_blocks * latent_t * frame_seq_length)
+        kv_cache, crossattn_cache = self._make_ar_rollout_caches(
+            batch_size=batch_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_tokens=cache_tokens,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        target_block = None
+        target_kv = None
+        target_attn = None
+        future_attn = None
+        current_start_frame = 0
+        future_block_index = min(rollout_blocks - 1, target_block_index + 1)
+
+        for block_idx in range(rollout_blocks):
+            noisy_z = torch.randn(
+                batch_size, latent_t, in_ch, latent_h, latent_w,
+                device=self.device, dtype=self.dtype,
+            )
+            denoise_t = torch.full(
+                (batch_size, latent_t),
+                int(denoise_timestep),
+                device=self.device,
+                dtype=torch.int64,
+            )
+            captured_future_attn = []
+            if block_idx == future_block_index:
+                self._set_attn_distill_capture(captured_future_attn)
+            try:
+                _, pred_x0 = self.model.generator(
+                    noisy_image_or_video=noisy_z,
+                    conditional_dict=conditional_dict,
+                    timestep=denoise_t,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start_frame * frame_seq_length,
+                )
+            finally:
+                self._clear_attn_distill_capture()
+
+            if block_idx == future_block_index:
+                future_attn = captured_future_attn
+
+            context_t = torch.zeros(
+                batch_size, latent_t, device=self.device, dtype=torch.int64
+            )
+            captured_kv = []
+            captured_attn = []
+            if block_idx == target_block_index:
+                self._set_kv_capture(captured_kv)
+                self._set_attn_distill_capture(captured_attn)
+            try:
+                self.model.generator(
+                    noisy_image_or_video=pred_x0,
+                    conditional_dict=conditional_dict,
+                    timestep=context_t,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start_frame * frame_seq_length,
+                )
+            finally:
+                self._clear_kv_capture()
+                self._clear_attn_distill_capture()
+
+            if block_idx == target_block_index:
+                target_block = pred_x0.detach()
+                target_kv = captured_kv
+                target_attn = captured_attn
+
+            current_start_frame += latent_t
+
+        if target_block is None or not target_kv:
+            raise RuntimeError("AR rollout distill failed to capture target block KV.")
+        if future_attn is None or not future_attn:
+            future_attn = target_attn
+
+        del kv_cache, crossattn_cache
+        return (
+            target_block.permute(0, 2, 1, 3, 4).contiguous(),
+            target_kv,
+            target_attn,
+            future_attn,
+            target_block_index * latent_t,
+        )
+
     def pretrain_compressor_kv_distill(self, num_steps=0):
         """Distill compressed per-layer KV toward pooled full-resolution teacher KV."""
         if num_steps <= 0 or not self.heterogeneous_cache_enabled or self.compressor is None:
@@ -480,6 +620,7 @@ class Trainer:
         generator_model = generator.model
         num_layers = getattr(generator_model, "num_layers", len(generator_model.blocks))
         num_heads = getattr(generator_model, "num_heads", 12)
+        head_dim = getattr(generator_model, "dim", 1536) // num_heads
 
         for param in self.model.generator.parameters():
             param.requires_grad_(False)
@@ -512,6 +653,15 @@ class Trainer:
         use_real_prompts = getattr(compressor_train_cfg, "kv_distill_use_real_prompts", False)
         prompt_path = getattr(compressor_train_cfg, "kv_distill_prompt_path", getattr(self.config, "data_path", ""))
         prompt_pool = self._load_kv_distill_prompts(prompt_path) if use_real_prompts else []
+        rollout_blocks = getattr(compressor_train_cfg, "kv_distill_rollout_blocks", 4)
+        target_block_index = getattr(
+            compressor_train_cfg,
+            "kv_distill_target_block_index",
+            max(0, getattr(getattr(self.config, "heterogeneous_cache", None), "Nsink", 8) // max(1, latent_t)),
+        )
+        if latent_source == "ar_rollout":
+            rollout_blocks = max(2, int(rollout_blocks))
+            target_block_index = min(max(0, int(target_block_index)), rollout_blocks - 2)
         global_rank = dist.get_rank() if dist.is_initialized() else 0
 
         if self.is_main_process:
@@ -522,7 +672,8 @@ class Trainer:
             print(
                 f"  KV distill source={latent_source}, "
                 f"attn_output_weight={attn_output_weight}, "
-                f"use_real_prompts={use_real_prompts}, prompt_pool={len(prompt_pool)}"
+                f"use_real_prompts={use_real_prompts}, prompt_pool={len(prompt_pool)}, "
+                f"rollout_blocks={rollout_blocks}, target_block_index={target_block_index}"
             )
 
         self.compressor.train()
@@ -542,16 +693,20 @@ class Trainer:
                         device=self.device, dtype=self.dtype,
                     )
                     z_btc = z_c_first.permute(0, 2, 1, 3, 4).contiguous()
-                elif latent_source in ("denoised", "rollout"):
+                    rope_start_frame = 0
+                    captured_kv = []
+                    captured_attn = []
+                    captured_query_attn = captured_attn
+                elif latent_source == "denoised":
                     noisy_z_btc = torch.randn(
                         batch_size, latent_t, in_ch, latent_h, latent_w,
                         device=self.device, dtype=self.dtype,
                     )
                     denoise_t = torch.full(
                         (batch_size, latent_t),
-                        float(denoise_timestep),
+                        int(denoise_timestep),
                         device=self.device,
-                        dtype=torch.float32,
+                        dtype=torch.int64,
                     )
                     _, pred_x0 = self.model.generator(
                         noisy_image_or_video=noisy_z_btc,
@@ -561,29 +716,55 @@ class Trainer:
                     z_btc = pred_x0.detach()
                     z_c_first = z_btc.permute(0, 2, 1, 3, 4).contiguous()
                     del noisy_z_btc, pred_x0
+                    rope_start_frame = 0
+                    captured_kv = []
+                    captured_attn = []
+                    captured_query_attn = captured_attn
+                elif latent_source == "ar_rollout":
+                    (
+                        z_c_first,
+                        captured_kv,
+                        captured_attn,
+                        captured_query_attn,
+                        rope_start_frame,
+                    ) = self._sample_ar_rollout_distill_block(
+                        conditional_dict=conditional_dict,
+                        batch_size=batch_size,
+                        in_ch=in_ch,
+                        latent_t=latent_t,
+                        latent_h=latent_h,
+                        latent_w=latent_w,
+                        num_layers=num_layers,
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                        denoise_timestep=int(denoise_timestep),
+                        rollout_blocks=rollout_blocks,
+                        target_block_index=target_block_index,
+                        generator_model=generator_model,
+                    )
+                    z_btc = None
                 else:
                     raise ValueError(
                         f"Unsupported kv_distill_latent_source={latent_source!r}; "
-                        "expected 'random', 'denoised', or 'rollout'."
+                        "expected 'random', 'denoised', or 'ar_rollout'."
                     )
 
-                timestep = torch.zeros(
-                    batch_size, latent_t, device=self.device, dtype=torch.int64
-                )
-                captured_kv = []
-                captured_attn = []
-                self._set_kv_capture(captured_kv)
-                if attn_output_weight > 0:
-                    self._set_attn_distill_capture(captured_attn)
-                try:
-                    self.model.generator(
-                        noisy_image_or_video=z_btc,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
+                if latent_source != "ar_rollout":
+                    timestep = torch.zeros(
+                        batch_size, latent_t, device=self.device, dtype=torch.int64
                     )
-                finally:
-                    self._clear_kv_capture()
-                    self._clear_attn_distill_capture()
+                    self._set_kv_capture(captured_kv)
+                    if attn_output_weight > 0:
+                        self._set_attn_distill_capture(captured_attn)
+                    try:
+                        self.model.generator(
+                            noisy_image_or_video=z_btc,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                        )
+                    finally:
+                        self._clear_kv_capture()
+                        self._clear_attn_distill_capture()
 
             compressed_tokens, _ = self.compressor(z_c_first, density_level)
             student_kv = self.compressor.project_to_kv(
@@ -599,7 +780,7 @@ class Trainer:
                     apply_temporal_rope_to_unrotated(
                         kv[0],
                         freqs=generator_model.freqs,
-                        start_frame=0,
+                        start_frame=rope_start_frame,
                         grid_shape=target_grid,
                         temporal_stride=2,
                     ),
@@ -627,8 +808,10 @@ class Trainer:
                     attn_output_weight > 0
                     and layer_idx in attn_layer_ids
                     and layer_idx < len(captured_attn)
+                    and layer_idx < len(captured_query_attn)
                 ):
-                    teacher_q, teacher_roped_k, teacher_attn_v = captured_attn[layer_idx]
+                    teacher_q = captured_query_attn[layer_idx][0]
+                    _, teacher_roped_k, teacher_attn_v = captured_attn[layer_idx]
                     layer_loss = layer_loss + attn_output_weight * self._attention_output_distill_loss(
                         teacher_q,
                         teacher_roped_k,
