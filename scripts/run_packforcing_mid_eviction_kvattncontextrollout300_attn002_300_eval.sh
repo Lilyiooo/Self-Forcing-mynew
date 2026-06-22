@@ -2,9 +2,9 @@
 set -euo pipefail
 
 REPO_ROOT="/inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew"
-RESULT_ROOT="/inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew_result"
+RESULT_ROOT="/inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew_result/mideviction_kvattncontextrollout300_attn002_300"
 TRAIN_LOGDIR="${RESULT_ROOT}/train"
-CONFIG_PATH="configs/packforcing_mid_eviction_kvattnrolloutdistill500_Nmid500_2500.yaml"
+CONFIG_PATH="configs/packforcing_mid_eviction_kvattncontextrollout300_attn002_300.yaml"
 
 cd "${REPO_ROOT}"
 
@@ -18,7 +18,7 @@ torchrun --standalone --nproc_per_node=8 train.py \
 
 mkdir -p "${RESULT_ROOT}"
 
-for step in $(seq 250 250 2500); do
+for step in 250 300; do
     step_padded="$(printf "%06d" "${step}")"
     checkpoint_path="${TRAIN_LOGDIR}/checkpoint_model_${step_padded}/model.pt"
     output_folder="${RESULT_ROOT}/step_${step_padded}"

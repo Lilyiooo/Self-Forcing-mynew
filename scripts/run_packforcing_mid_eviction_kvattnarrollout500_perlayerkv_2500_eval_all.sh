@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="/inspire/ssd/project/video-generation/public/wangqiqi/Self-Forcing-mynew"
-RESULT_ROOT="/inspire/qb-ilm/project/video-generation/public/wangqiqi/Self-Forcing-packforcing/mideviction_kvattnarrollout500_perlayerkv_2500"
+REPO_ROOT="/inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew"
+RESULT_ROOT="/inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew_result/mideviction_kvattnarrollout500_perlayerkv_2500"
 TRAIN_LOGDIR="${RESULT_ROOT}/train"
 CONFIG_PATH="configs/packforcing_mid_eviction_kvattnarrollout500_2500.yaml"
 
@@ -26,9 +26,9 @@ for step in $(seq 250 250 2500); do
     python inference.py \
         --config_path "${CONFIG_PATH}" \
         --checkpoint_path "${checkpoint_path}" \
-        --data_path prompts/validation_60s.txt \
+        --data_path "${REPO_ROOT}/prompts/validation_60s.txt" \
         --output_folder "${output_folder}" \
         --num_output_frames 240
 done
 
-python /inspire/ssd/project/video-generation/public/wangqiqi/occupy.py -m 95
+python /inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/projects_402/occupy.py -m 95

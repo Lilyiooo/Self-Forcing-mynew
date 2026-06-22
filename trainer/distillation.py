@@ -409,6 +409,17 @@ class Trainer:
             if hasattr(block.self_attn, "_attn_distill_capture_list"):
                 delattr(block.self_attn, "_attn_distill_capture_list")
 
+    def _set_attn_context_capture(self, capture_list):
+        generator = self._unwrap_generator()
+        for block in generator.model.blocks:
+            block.self_attn._attn_context_capture_list = capture_list
+
+    def _clear_attn_context_capture(self):
+        generator = self._unwrap_generator()
+        for block in generator.model.blocks:
+            if hasattr(block.self_attn, "_attn_context_capture_list"):
+                delattr(block.self_attn, "_attn_context_capture_list")
+
     def _select_distill_layers(self, used_layers: int, max_layers: int):
         if max_layers <= 0 or max_layers >= used_layers:
             return list(range(used_layers))
@@ -456,6 +467,50 @@ class Trainer:
             dim=-1,
         ).mean())
         return loss
+
+    def _context_replacement_attn_loss(
+        self,
+        query,
+        teacher_context,
+        student_k,
+        student_v,
+        target_start_token: int,
+        target_num_tokens: int,
+        num_query_tokens: int,
+    ):
+        """Match future attention when only the target block is compressed."""
+        context_k = teacher_context["k"]
+        context_v = teacher_context["v"]
+        context_start = int(teacher_context.get("context_start", 0))
+        target_start = int(target_start_token) - context_start
+        target_end = target_start + int(target_num_tokens)
+        if target_start < 0 or target_end > context_k.shape[1]:
+            return None
+
+        student_context_k = torch.cat(
+            [
+                context_k[:, :target_start].detach(),
+                student_k,
+                context_k[:, target_end:].detach(),
+            ],
+            dim=1,
+        )
+        student_context_v = torch.cat(
+            [
+                context_v[:, :target_start].detach(),
+                student_v,
+                context_v[:, target_end:].detach(),
+            ],
+            dim=1,
+        )
+        return self._attention_output_distill_loss(
+            query=query,
+            teacher_k=context_k,
+            teacher_v=context_v,
+            student_k=student_context_k,
+            student_v=student_context_v,
+            num_query_tokens=num_query_tokens,
+        )
 
     def _load_kv_distill_prompts(self, prompt_path: str):
         if not prompt_path:
@@ -535,6 +590,7 @@ class Trainer:
         target_kv = None
         target_attn = None
         future_attn = None
+        future_context = None
         current_start_frame = 0
         future_block_index = min(
             rollout_blocks - 1,
@@ -553,8 +609,10 @@ class Trainer:
                 dtype=torch.int64,
             )
             captured_future_attn = []
+            captured_future_context = []
             if block_idx == future_block_index:
                 self._set_attn_distill_capture(captured_future_attn)
+                self._set_attn_context_capture(captured_future_context)
             try:
                 _, pred_x0 = self.model.generator(
                     noisy_image_or_video=noisy_z,
@@ -566,9 +624,11 @@ class Trainer:
                 )
             finally:
                 self._clear_attn_distill_capture()
+                self._clear_attn_context_capture()
 
             if block_idx == future_block_index:
                 future_attn = captured_future_attn
+                future_context = captured_future_context
 
             context_t = torch.zeros(
                 batch_size, latent_t, device=self.device, dtype=torch.int64
@@ -609,6 +669,7 @@ class Trainer:
             target_kv,
             target_attn,
             future_attn,
+            future_context,
             target_block_index * latent_t,
         )
 
@@ -652,6 +713,9 @@ class Trainer:
         attn_output_weight = getattr(compressor_train_cfg, "kv_distill_attn_output_weight", 0.0)
         attn_query_tokens = getattr(compressor_train_cfg, "kv_distill_attn_query_tokens", 128)
         attn_max_layers = getattr(compressor_train_cfg, "kv_distill_attn_max_layers", 8)
+        attn_context_replacement = getattr(
+            compressor_train_cfg, "kv_distill_attn_context_replacement", False
+        )
         latent_source = getattr(compressor_train_cfg, "kv_distill_latent_source", "random")
         denoise_timestep = getattr(compressor_train_cfg, "kv_distill_denoise_timestep", 750)
         use_real_prompts = getattr(compressor_train_cfg, "kv_distill_use_real_prompts", False)
@@ -704,6 +768,7 @@ class Trainer:
             print(
                 f"  KV distill source={latent_source}, "
                 f"attn_output_weight={attn_output_weight}, "
+                f"attn_context_replacement={attn_context_replacement}, "
                 f"use_real_prompts={use_real_prompts}, prompt_pool={len(prompt_pool)}, "
                 f"rollout_blocks={rollout_blocks}, target_block_index={target_block_index}, "
                 f"future_gap_blocks={future_gap_blocks}, future_block_index={future_block_index}"
@@ -730,6 +795,7 @@ class Trainer:
                     captured_kv = []
                     captured_attn = []
                     captured_query_attn = captured_attn
+                    captured_query_context = None
                 elif latent_source == "denoised":
                     noisy_z_btc = torch.randn(
                         batch_size, latent_t, in_ch, latent_h, latent_w,
@@ -753,12 +819,14 @@ class Trainer:
                     captured_kv = []
                     captured_attn = []
                     captured_query_attn = captured_attn
+                    captured_query_context = None
                 elif latent_source == "ar_rollout":
                     (
                         z_c_first,
                         captured_kv,
                         captured_attn,
                         captured_query_attn,
+                        captured_query_context,
                         rope_start_frame,
                     ) = self._sample_ar_rollout_distill_block(
                         conditional_dict=conditional_dict,
@@ -846,14 +914,31 @@ class Trainer:
                 ):
                     teacher_q = captured_query_attn[layer_idx][0]
                     _, teacher_roped_k, teacher_attn_v = captured_attn[layer_idx]
-                    layer_loss = layer_loss + attn_output_weight * self._attention_output_distill_loss(
-                        teacher_q,
-                        teacher_roped_k,
-                        teacher_attn_v,
-                        student_roped_kv[layer_idx][0],
-                        student_roped_kv[layer_idx][1],
-                        num_query_tokens=attn_query_tokens,
-                    )
+                    attn_loss = None
+                    if (
+                        attn_context_replacement
+                        and captured_query_context is not None
+                        and layer_idx < len(captured_query_context)
+                    ):
+                        attn_loss = self._context_replacement_attn_loss(
+                            query=teacher_q,
+                            teacher_context=captured_query_context[layer_idx],
+                            student_k=student_roped_kv[layer_idx][0],
+                            student_v=student_roped_kv[layer_idx][1],
+                            target_start_token=rope_start_frame * (latent_h // 2) * (latent_w // 2),
+                            target_num_tokens=latent_t * (latent_h // 2) * (latent_w // 2),
+                            num_query_tokens=attn_query_tokens,
+                        )
+                    if attn_loss is None:
+                        attn_loss = self._attention_output_distill_loss(
+                            teacher_q,
+                            teacher_roped_k,
+                            teacher_attn_v,
+                            student_roped_kv[layer_idx][0],
+                            student_roped_kv[layer_idx][1],
+                            num_query_tokens=attn_query_tokens,
+                        )
+                    layer_loss = layer_loss + attn_output_weight * attn_loss
                 loss = loss + layer_loss
             loss = loss / max(1, used_layers)
 

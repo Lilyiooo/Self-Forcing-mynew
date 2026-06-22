@@ -73,12 +73,12 @@ compressor_training:
   pretrain_epochs: 0
   pretrain_lr: 0.001
   pretrain_batch_size: 2
-  kv_distill_steps: 500
+  kv_distill_steps: 300
   kv_distill_lr: 1.0e-4
   kv_distill_batch_size: 1
   kv_distill_density_level: mid
   kv_distill_cosine_weight: 0.1
-  kv_distill_attn_output_weight: 0.1
+  kv_distill_attn_output_weight: 0.01
   kv_distill_attn_query_tokens: 128
   kv_distill_attn_max_layers: 8
   kv_distill_latent_source: ar_rollout
@@ -96,5 +96,5 @@ compressor_training:
 val_num_latent_frames: 240
 prompt_path: /inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew/prompts/validation_60s.txt
 num_val_prompts: 2
-max_train_steps: 2500
+max_train_steps: 300
 validate_on_save: false

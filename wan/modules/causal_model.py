@@ -266,6 +266,19 @@ class CausalWanSelfAttention(nn.Module):
                 attn_v = torch.cat([sink_v, recent_v], dim=1)
                 mid_len = 0
 
+            if hasattr(self, "_attn_context_capture_list"):
+                context_start = max(0, local_end_index - self.max_attention_size)
+                self._attn_context_capture_list.append({
+                    "k": attn_k.detach(),
+                    "v": attn_v.detach(),
+                    "sink_len": int(sink_len),
+                    "mid_len": int(mid_len),
+                    "recent_len": int(recent_k.shape[1]),
+                    "context_start": int(context_start),
+                    "local_start_index": int(local_start_index),
+                    "local_end_index": int(local_end_index),
+                })
+
             debug_logger = kv_cache.get("_debug_logger") if kv_cache is not None else None
             if debug_logger is not None:
                 debug_logger.log(
