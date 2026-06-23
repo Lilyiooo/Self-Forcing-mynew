@@ -427,6 +427,62 @@ class Trainer:
             return [used_layers - 1]
         return torch.linspace(0, used_layers - 1, steps=max_layers).round().long().unique().tolist()
 
+    def _sample_spatial_balanced_query_indices(
+        self,
+        frames: int,
+        height: int,
+        width: int,
+        num_query_tokens: int,
+        device,
+        grid_h: int = 4,
+        grid_w: int = 4,
+    ):
+        total_tokens = int(frames) * int(height) * int(width)
+        if num_query_tokens <= 0 or total_tokens <= num_query_tokens:
+            return torch.arange(total_tokens, device=device, dtype=torch.long)
+
+        indices = []
+        grid_h = max(1, int(grid_h))
+        grid_w = max(1, int(grid_w))
+        height = int(height)
+        width = int(width)
+        for t in range(int(frames)):
+            frame_offset = t * height * width
+            for gh in range(grid_h):
+                h0 = (gh * height) // grid_h
+                h1 = ((gh + 1) * height) // grid_h
+                if h1 <= h0:
+                    continue
+                for gw in range(grid_w):
+                    w0 = (gw * width) // grid_w
+                    w1 = ((gw + 1) * width) // grid_w
+                    if w1 <= w0:
+                        continue
+                    h = (h0 + h1 - 1) // 2
+                    w = (w0 + w1 - 1) // 2
+                    indices.append(frame_offset + h * width + w)
+
+        if len(indices) < num_query_tokens:
+            indices.extend(
+                torch.linspace(
+                    0,
+                    total_tokens - 1,
+                    steps=num_query_tokens,
+                    device=device,
+                ).round().long().tolist()
+            )
+
+        indices = torch.tensor(indices, device=device, dtype=torch.long).unique(sorted=True)
+        if indices.numel() > num_query_tokens:
+            keep = torch.linspace(
+                0,
+                indices.numel() - 1,
+                steps=num_query_tokens,
+                device=device,
+            ).round().long()
+            indices = indices.index_select(0, keep)
+        return indices
+
     def _attention_output_distill_loss(
         self,
         query,
@@ -435,14 +491,29 @@ class Trainer:
         student_k,
         student_v,
         num_query_tokens: int,
+        query_grid_shape=None,
+        query_sampling: str = "uniform",
+        query_grid_h: int = 4,
+        query_grid_w: int = 4,
     ):
         """Match Attn(Q, compressed K/V) to Attn(Q, full K/V) on sampled queries."""
         num_tokens = query.shape[1]
         if num_tokens > num_query_tokens:
-            indices = torch.linspace(
-                0, num_tokens - 1, steps=num_query_tokens,
-                device=query.device,
-            ).round().long()
+            if query_sampling == "spatial_balanced" and query_grid_shape is not None:
+                indices = self._sample_spatial_balanced_query_indices(
+                    frames=query_grid_shape[0],
+                    height=query_grid_shape[1],
+                    width=query_grid_shape[2],
+                    num_query_tokens=num_query_tokens,
+                    device=query.device,
+                    grid_h=query_grid_h,
+                    grid_w=query_grid_w,
+                )
+            else:
+                indices = torch.linspace(
+                    0, num_tokens - 1, steps=num_query_tokens,
+                    device=query.device,
+                ).round().long()
             query = query.index_select(1, indices)
 
         q = query.detach().transpose(1, 2).float()
@@ -477,6 +548,10 @@ class Trainer:
         target_start_token: int,
         target_num_tokens: int,
         num_query_tokens: int,
+        query_grid_shape=None,
+        query_sampling: str = "uniform",
+        query_grid_h: int = 4,
+        query_grid_w: int = 4,
     ):
         """Match future attention when only the target block is compressed."""
         context_k = teacher_context["k"]
@@ -510,6 +585,10 @@ class Trainer:
             student_k=student_context_k,
             student_v=student_context_v,
             num_query_tokens=num_query_tokens,
+            query_grid_shape=query_grid_shape,
+            query_sampling=query_sampling,
+            query_grid_h=query_grid_h,
+            query_grid_w=query_grid_w,
         )
 
     def _load_kv_distill_prompts(self, prompt_path: str):
@@ -709,6 +788,8 @@ class Trainer:
         latent_w = getattr(compressor_train_cfg, "kv_distill_latent_W", 104)
         in_ch = getattr(getattr(self.config, "compressor", None), "in_ch", 16)
         density_level = getattr(compressor_train_cfg, "kv_distill_density_level", "mid")
+        k_weight = getattr(compressor_train_cfg, "kv_distill_k_weight", 1.0)
+        v_weight = getattr(compressor_train_cfg, "kv_distill_v_weight", 1.0)
         cosine_weight = getattr(compressor_train_cfg, "kv_distill_cosine_weight", 0.1)
         attn_output_weight = getattr(compressor_train_cfg, "kv_distill_attn_output_weight", 0.0)
         attn_query_tokens = getattr(compressor_train_cfg, "kv_distill_attn_query_tokens", 128)
@@ -716,6 +797,9 @@ class Trainer:
         attn_context_replacement = getattr(
             compressor_train_cfg, "kv_distill_attn_context_replacement", False
         )
+        query_sampling = getattr(compressor_train_cfg, "kv_distill_query_sampling", "uniform")
+        query_grid_h = getattr(compressor_train_cfg, "kv_distill_query_grid_h", 4)
+        query_grid_w = getattr(compressor_train_cfg, "kv_distill_query_grid_w", 4)
         latent_source = getattr(compressor_train_cfg, "kv_distill_latent_source", "random")
         denoise_timestep = getattr(compressor_train_cfg, "kv_distill_denoise_timestep", 750)
         use_real_prompts = getattr(compressor_train_cfg, "kv_distill_use_real_prompts", False)
@@ -769,6 +853,8 @@ class Trainer:
                 f"  KV distill source={latent_source}, "
                 f"attn_output_weight={attn_output_weight}, "
                 f"attn_context_replacement={attn_context_replacement}, "
+                f"query_sampling={query_sampling}, query_grid={query_grid_h}x{query_grid_w}, "
+                f"k_weight={k_weight}, v_weight={v_weight}, "
                 f"use_real_prompts={use_real_prompts}, prompt_pool={len(prompt_pool)}, "
                 f"rollout_blocks={rollout_blocks}, target_block_index={target_block_index}, "
                 f"future_gap_blocks={future_gap_blocks}, future_block_index={future_block_index}"
@@ -900,8 +986,8 @@ class Trainer:
                 target_k = self._pool_teacher_kv_to_grid(teacher_k, full_grid, target_grid)
                 target_v = self._pool_teacher_kv_to_grid(teacher_v, full_grid, target_grid)
                 pred_k, pred_v = student_kv[layer_idx][0], student_kv[layer_idx][1]
-                layer_loss = F.mse_loss(pred_k.float(), target_k.float())
-                layer_loss = layer_loss + F.mse_loss(pred_v.float(), target_v.float())
+                layer_loss = k_weight * F.mse_loss(pred_k.float(), target_k.float())
+                layer_loss = layer_loss + v_weight * F.mse_loss(pred_v.float(), target_v.float())
                 layer_loss = layer_loss + cosine_weight * (
                     1 - F.cosine_similarity(pred_k.float(), target_k.float(), dim=-1).mean()
                     + 1 - F.cosine_similarity(pred_v.float(), target_v.float(), dim=-1).mean()
@@ -928,6 +1014,10 @@ class Trainer:
                             target_start_token=rope_start_frame * (latent_h // 2) * (latent_w // 2),
                             target_num_tokens=latent_t * (latent_h // 2) * (latent_w // 2),
                             num_query_tokens=attn_query_tokens,
+                            query_grid_shape=full_grid,
+                            query_sampling=query_sampling,
+                            query_grid_h=query_grid_h,
+                            query_grid_w=query_grid_w,
                         )
                     if attn_loss is None:
                         attn_loss = self._attention_output_distill_loss(
@@ -937,6 +1027,10 @@ class Trainer:
                             student_roped_kv[layer_idx][0],
                             student_roped_kv[layer_idx][1],
                             num_query_tokens=attn_query_tokens,
+                            query_grid_shape=full_grid,
+                            query_sampling=query_sampling,
+                            query_grid_h=query_grid_h,
+                            query_grid_w=query_grid_w,
                         )
                     layer_loss = layer_loss + attn_output_weight * attn_loss
                 loss = loss + layer_loss
