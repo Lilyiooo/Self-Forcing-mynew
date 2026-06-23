@@ -495,11 +495,39 @@ class Trainer:
         query_sampling: str = "uniform",
         query_grid_h: int = 4,
         query_grid_w: int = 4,
+        spatial_ratio: float = 0.5,
     ):
         """Match Attn(Q, compressed K/V) to Attn(Q, full K/V) on sampled queries."""
         num_tokens = query.shape[1]
         if num_tokens > num_query_tokens:
-            if query_sampling == "spatial_balanced" and query_grid_shape is not None:
+            if query_sampling == "mixed" and query_grid_shape is not None:
+                num_spatial = int(round(num_query_tokens * float(spatial_ratio)))
+                num_spatial = min(max(0, num_spatial), num_query_tokens)
+                spatial_indices = self._sample_spatial_balanced_query_indices(
+                    frames=query_grid_shape[0],
+                    height=query_grid_shape[1],
+                    width=query_grid_shape[2],
+                    num_query_tokens=max(1, num_spatial),
+                    device=query.device,
+                    grid_h=query_grid_h,
+                    grid_w=query_grid_w,
+                ) if num_spatial > 0 else torch.empty(0, device=query.device, dtype=torch.long)
+                num_uniform = max(0, num_query_tokens - spatial_indices.numel())
+                if num_uniform > 0:
+                    uniform_indices = torch.linspace(
+                        0, num_tokens - 1, steps=num_uniform,
+                        device=query.device,
+                    ).round().long()
+                    indices = torch.cat([spatial_indices, uniform_indices]).unique(sorted=True)
+                else:
+                    indices = spatial_indices
+                if indices.numel() > num_query_tokens:
+                    keep = torch.linspace(
+                        0, indices.numel() - 1, steps=num_query_tokens,
+                        device=query.device,
+                    ).round().long()
+                    indices = indices.index_select(0, keep)
+            elif query_sampling == "spatial_balanced" and query_grid_shape is not None:
                 indices = self._sample_spatial_balanced_query_indices(
                     frames=query_grid_shape[0],
                     height=query_grid_shape[1],
@@ -552,6 +580,7 @@ class Trainer:
         query_sampling: str = "uniform",
         query_grid_h: int = 4,
         query_grid_w: int = 4,
+        spatial_ratio: float = 0.5,
     ):
         """Match future attention when only the target block is compressed."""
         context_k = teacher_context["k"]
@@ -589,6 +618,7 @@ class Trainer:
             query_sampling=query_sampling,
             query_grid_h=query_grid_h,
             query_grid_w=query_grid_w,
+            spatial_ratio=spatial_ratio,
         )
 
     def _load_kv_distill_prompts(self, prompt_path: str):
@@ -792,6 +822,7 @@ class Trainer:
         v_weight = getattr(compressor_train_cfg, "kv_distill_v_weight", 1.0)
         cosine_weight = getattr(compressor_train_cfg, "kv_distill_cosine_weight", 0.1)
         attn_output_weight = getattr(compressor_train_cfg, "kv_distill_attn_output_weight", 0.0)
+        context_weight = getattr(compressor_train_cfg, "kv_distill_context_weight", attn_output_weight)
         attn_query_tokens = getattr(compressor_train_cfg, "kv_distill_attn_query_tokens", 128)
         attn_max_layers = getattr(compressor_train_cfg, "kv_distill_attn_max_layers", 8)
         attn_context_replacement = getattr(
@@ -800,16 +831,23 @@ class Trainer:
         query_sampling = getattr(compressor_train_cfg, "kv_distill_query_sampling", "uniform")
         query_grid_h = getattr(compressor_train_cfg, "kv_distill_query_grid_h", 4)
         query_grid_w = getattr(compressor_train_cfg, "kv_distill_query_grid_w", 4)
+        spatial_ratio = getattr(compressor_train_cfg, "kv_distill_spatial_ratio", 0.5)
         latent_source = getattr(compressor_train_cfg, "kv_distill_latent_source", "random")
         denoise_timestep = getattr(compressor_train_cfg, "kv_distill_denoise_timestep", 750)
         use_real_prompts = getattr(compressor_train_cfg, "kv_distill_use_real_prompts", False)
         prompt_path = getattr(compressor_train_cfg, "kv_distill_prompt_path", getattr(self.config, "data_path", ""))
         prompt_pool = self._load_kv_distill_prompts(prompt_path) if use_real_prompts else []
         rollout_blocks = getattr(compressor_train_cfg, "kv_distill_rollout_blocks", 4)
+        random_target = getattr(compressor_train_cfg, "kv_distill_random_target", False)
         target_block_index = getattr(
             compressor_train_cfg,
             "kv_distill_target_block_index",
             max(0, getattr(getattr(self.config, "heterogeneous_cache", None), "Nsink", 8) // max(1, latent_t)),
+        )
+        nsink = getattr(
+            getattr(self.config, "heterogeneous_cache", None),
+            "Nsink",
+            0,
         )
         nrecent = getattr(
             getattr(self.config, "heterogeneous_cache", None),
@@ -826,13 +864,17 @@ class Trainer:
             "kv_distill_future_gap_blocks",
             default_future_gap_blocks,
         )
+        future_gap_min = getattr(compressor_train_cfg, "kv_distill_future_gap_min", future_gap_blocks)
+        future_gap_max = getattr(compressor_train_cfg, "kv_distill_future_gap_max", future_gap_blocks)
         if latent_source == "ar_rollout":
             rollout_blocks = max(2, int(rollout_blocks))
             future_gap_blocks = max(1, int(future_gap_blocks))
+            future_gap_min = max(1, int(future_gap_min))
+            future_gap_max = max(future_gap_min, int(future_gap_max))
             target_block_index = max(0, int(target_block_index))
             rollout_blocks = max(
                 rollout_blocks,
-                target_block_index + future_gap_blocks + 1,
+                target_block_index + future_gap_max + 1,
             )
             target_block_index = min(target_block_index, rollout_blocks - 2)
             future_block_index = min(
@@ -852,12 +894,16 @@ class Trainer:
             print(
                 f"  KV distill source={latent_source}, "
                 f"attn_output_weight={attn_output_weight}, "
+                f"context_weight={context_weight}, "
                 f"attn_context_replacement={attn_context_replacement}, "
                 f"query_sampling={query_sampling}, query_grid={query_grid_h}x{query_grid_w}, "
+                f"spatial_ratio={spatial_ratio}, "
                 f"k_weight={k_weight}, v_weight={v_weight}, "
                 f"use_real_prompts={use_real_prompts}, prompt_pool={len(prompt_pool)}, "
                 f"rollout_blocks={rollout_blocks}, target_block_index={target_block_index}, "
-                f"future_gap_blocks={future_gap_blocks}, future_block_index={future_block_index}"
+                f"random_target={random_target}, future_gap_min={future_gap_min}, "
+                f"future_gap_max={future_gap_max}, future_gap_blocks={future_gap_blocks}, "
+                f"future_block_index={future_block_index}"
             )
 
         self.compressor.train()
@@ -907,6 +953,30 @@ class Trainer:
                     captured_query_attn = captured_attn
                     captured_query_context = None
                 elif latent_source == "ar_rollout":
+                    effective_future_gap_blocks = future_gap_blocks
+                    effective_target_block_index = target_block_index
+                    if random_target:
+                        if future_gap_max > future_gap_min:
+                            effective_future_gap_blocks = int(torch.randint(
+                                low=future_gap_min,
+                                high=future_gap_max + 1,
+                                size=(1,),
+                                device=self.device,
+                            ).item())
+                        else:
+                            effective_future_gap_blocks = future_gap_min
+                        max_target_block = max(0, rollout_blocks - effective_future_gap_blocks - 1)
+                        sink_blocks = max(0, int(nsink) // max(1, int(latent_t)))
+                        min_target_block = min(sink_blocks, max_target_block)
+                        if max_target_block > min_target_block:
+                            effective_target_block_index = int(torch.randint(
+                                low=min_target_block,
+                                high=max_target_block + 1,
+                                size=(1,),
+                                device=self.device,
+                            ).item())
+                        else:
+                            effective_target_block_index = min_target_block
                     (
                         z_c_first,
                         captured_kv,
@@ -926,8 +996,8 @@ class Trainer:
                         head_dim=head_dim,
                         denoise_timestep=int(denoise_timestep),
                         rollout_blocks=rollout_blocks,
-                        target_block_index=target_block_index,
-                        future_gap_blocks=future_gap_blocks,
+                        target_block_index=effective_target_block_index,
+                        future_gap_blocks=effective_future_gap_blocks,
                         generator_model=generator_model,
                     )
                     z_btc = None
@@ -993,7 +1063,7 @@ class Trainer:
                     + 1 - F.cosine_similarity(pred_v.float(), target_v.float(), dim=-1).mean()
                 )
                 if (
-                    attn_output_weight > 0
+                    (attn_output_weight > 0 or context_weight > 0)
                     and layer_idx in attn_layer_ids
                     and layer_idx < len(captured_attn)
                     and layer_idx < len(captured_query_attn)
@@ -1001,8 +1071,10 @@ class Trainer:
                     teacher_q = captured_query_attn[layer_idx][0]
                     _, teacher_roped_k, teacher_attn_v = captured_attn[layer_idx]
                     attn_loss = None
+                    attn_loss_weight = attn_output_weight
                     if (
-                        attn_context_replacement
+                        context_weight > 0
+                        and attn_context_replacement
                         and captured_query_context is not None
                         and layer_idx < len(captured_query_context)
                     ):
@@ -1018,8 +1090,11 @@ class Trainer:
                             query_sampling=query_sampling,
                             query_grid_h=query_grid_h,
                             query_grid_w=query_grid_w,
+                            spatial_ratio=spatial_ratio,
                         )
-                    if attn_loss is None:
+                        if attn_loss is not None:
+                            attn_loss_weight = context_weight
+                    if attn_loss is None and attn_output_weight > 0:
                         attn_loss = self._attention_output_distill_loss(
                             teacher_q,
                             teacher_roped_k,
@@ -1031,8 +1106,10 @@ class Trainer:
                             query_sampling=query_sampling,
                             query_grid_h=query_grid_h,
                             query_grid_w=query_grid_w,
+                            spatial_ratio=spatial_ratio,
                         )
-                    layer_loss = layer_loss + attn_output_weight * attn_loss
+                    if attn_loss is not None:
+                        layer_loss = layer_loss + attn_loss_weight * attn_loss
                 loss = loss + layer_loss
             loss = loss / max(1, used_layers)
 
