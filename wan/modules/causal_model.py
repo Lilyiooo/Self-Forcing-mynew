@@ -211,6 +211,8 @@ class CausalWanSelfAttention(nn.Module):
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
             roped_key = causal_rope_apply(
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+            if hasattr(self, "_dcs_query_capture_list"):
+                self._dcs_query_capture_list.append(roped_query.detach())
             if hasattr(self, "_kv_capture_list"):
                 self._kv_capture_list.append((k.detach(), v.detach()))
             if hasattr(self, "_attn_distill_capture_list"):

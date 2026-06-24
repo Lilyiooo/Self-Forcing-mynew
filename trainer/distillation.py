@@ -1051,6 +1051,9 @@ class Trainer:
             loss = torch.tensor(0.0, device=self.device)
             used_layers = min(len(captured_kv), num_layers)
             attn_layer_ids = set(self._select_distill_layers(used_layers, attn_max_layers))
+            context_replacement_used = 0
+            context_replacement_fallback = 0
+            attn_loss_skipped = 0
             for layer_idx, captured_item in enumerate(captured_kv[:used_layers]):
                 teacher_k, teacher_v = captured_item
                 target_k = self._pool_teacher_kv_to_grid(teacher_k, full_grid, target_grid)
@@ -1072,12 +1075,14 @@ class Trainer:
                     _, teacher_roped_k, teacher_attn_v = captured_attn[layer_idx]
                     attn_loss = None
                     attn_loss_weight = attn_output_weight
+                    attempted_context_replacement = False
                     if (
                         context_weight > 0
                         and attn_context_replacement
                         and captured_query_context is not None
                         and layer_idx < len(captured_query_context)
                     ):
+                        attempted_context_replacement = True
                         attn_loss = self._context_replacement_attn_loss(
                             query=teacher_q,
                             teacher_context=captured_query_context[layer_idx],
@@ -1094,6 +1099,7 @@ class Trainer:
                         )
                         if attn_loss is not None:
                             attn_loss_weight = context_weight
+                            context_replacement_used += 1
                     if attn_loss is None and attn_output_weight > 0:
                         attn_loss = self._attention_output_distill_loss(
                             teacher_q,
@@ -1108,8 +1114,12 @@ class Trainer:
                             query_grid_w=query_grid_w,
                             spatial_ratio=spatial_ratio,
                         )
+                        if attempted_context_replacement:
+                            context_replacement_fallback += 1
                     if attn_loss is not None:
                         layer_loss = layer_loss + attn_loss_weight * attn_loss
+                    else:
+                        attn_loss_skipped += 1
                 loss = loss + layer_loss
             loss = loss / max(1, used_layers)
 
@@ -1121,7 +1131,12 @@ class Trainer:
             optimizer.step()
 
             if step_idx % 10 == 0 and self.is_main_process:
-                print(f"  KV distill step {step_idx}/{num_steps}, loss={loss.item():.6f}")
+                print(
+                    f"  KV distill step {step_idx}/{num_steps}, loss={loss.item():.6f}, "
+                    f"context_used={context_replacement_used}, "
+                    f"context_fallback={context_replacement_fallback}, "
+                    f"attn_skipped={attn_loss_skipped}"
+                )
 
         for param in self.model.generator.parameters():
             param.requires_grad_(True)

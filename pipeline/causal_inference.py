@@ -84,6 +84,15 @@ class CausalInferencePipeline(torch.nn.Module):
                 "top_k_blocks",
                 getattr(het_cfg, "top_k_blocks", 8),
             )
+            self.top_k_selection_strategy = getattr(top_k_cfg, "selection_strategy", "recency")
+            self.top_k_selection_once_per_chunk = getattr(top_k_cfg, "selection_once_per_chunk", True)
+            self.query_affinity_layer_ids = list(getattr(top_k_cfg, "query_affinity_layer_ids", [8, 16, 24]))
+            self.query_affinity_tokens = getattr(top_k_cfg, "query_affinity_tokens", 128)
+            self.query_affinity_prev_bonus = getattr(top_k_cfg, "query_affinity_prev_bonus", 0.05)
+            self.query_affinity_query_sampling = getattr(top_k_cfg, "query_affinity_query_sampling", "mixed")
+            self.query_affinity_spatial_ratio = getattr(top_k_cfg, "query_affinity_spatial_ratio", 0.5)
+            self.query_affinity_query_grid_h = getattr(top_k_cfg, "query_affinity_query_grid_h", 3)
+            self.query_affinity_query_grid_w = getattr(top_k_cfg, "query_affinity_query_grid_w", 3)
             print(f"Heterogeneous KV cache enabled: Nsink={het_cfg.Nsink}, "
                   f"Nrecent={het_cfg.Nrecent}, Nmid_tokens={het_cfg.Nmid_tokens}")
 
@@ -101,6 +110,8 @@ class CausalInferencePipeline(torch.nn.Module):
             self.het_kv_cache = None
             self._recent_clean_blocks = []
             self._applied_rope_delta_frames = 0
+            self._dcs_query_capture = None
+            self._dcs_query_capture_layers = []
             self.cache_debug_logger = make_cache_debug_logger(args)
         else:
             self.cache_debug_logger = None
@@ -285,12 +296,25 @@ class CausalInferencePipeline(torch.nn.Module):
                     dtype=torch.int64) * current_timestep
 
                 if index < len(self.denoising_step_list) - 1:
+                    capture_dcs_query = (
+                        self.heterogeneous_cache_enabled
+                        and self.top_k_enabled
+                        and self.top_k_selection_strategy == "query_affinity"
+                        and index == 0
+                    )
                     _, denoised_pred = self._run_generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
                         timestep=timestep,
                         current_start_frame=current_start_frame,
+                        capture_dcs_query=capture_dcs_query,
                     )
+                    if capture_dcs_query:
+                        self._update_query_affinity_selection(
+                            chunk_idx=chunk_idx,
+                            current_start_frame=current_start_frame,
+                            current_num_frames=current_num_frames,
+                        )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -470,6 +494,10 @@ class CausalInferencePipeline(torch.nn.Module):
             top_k_enabled=self.top_k_enabled,
             top_k_blocks=self.top_k_blocks,
             mid_archive_capacity_blocks=getattr(het_cfg, "mid_archive_capacity_blocks", 64),
+            selection_strategy=self.top_k_selection_strategy,
+            query_affinity_layer_ids=self.query_affinity_layer_ids,
+            query_affinity_tokens=self.query_affinity_tokens,
+            query_affinity_prev_bonus=self.query_affinity_prev_bonus,
         )
         if self.cache_debug_logger is not None:
             self.het_kv_cache.set_debug_logger(self.cache_debug_logger)
@@ -478,6 +506,8 @@ class CausalInferencePipeline(torch.nn.Module):
         self.density_estimator.reset_stats()
         self._recent_clean_blocks = []
         self._applied_rope_delta_frames = 0
+        self._dcs_query_capture = None
+        self._dcs_query_capture_layers = []
 
         # Set up the old-style caches as aliases for backward compatibility
         self.kv_cache1 = [self.het_kv_cache.get_layer_cache(i) for i in range(self.num_transformer_blocks)]
@@ -498,33 +528,146 @@ class CausalInferencePipeline(torch.nn.Module):
             applied_rope_delta_frames=self._applied_rope_delta_frames,
         )
 
-    def _run_generator(self, noisy_image_or_video, conditional_dict, timestep, current_start_frame):
-        """Run generator with or without heterogeneous cache."""
-        if self.heterogeneous_cache_enabled and self.het_kv_cache is not None:
-            # Build per-layer mid_kv list
-            mid_kv_per_layer = []
-            for layer_idx in range(self.num_transformer_blocks):
-                mid_kv = self.het_kv_cache.get_mid_kv(layer_idx)
-                mid_kv_per_layer.append(mid_kv)
+    def _set_dcs_query_capture(self, capture_layers: set[int]) -> list:
+        capture_list = []
+        if not capture_layers:
+            return capture_list
+        for layer_idx, block in enumerate(self.generator.model.blocks):
+            if layer_idx in capture_layers:
+                block.self_attn._dcs_query_capture_list = capture_list
+        return capture_list
 
-            return self.generator(
-                noisy_image_or_video=noisy_image_or_video,
-                conditional_dict=conditional_dict,
-                timestep=timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-                mid_kv_per_layer=mid_kv_per_layer,
-            )
+    def _clear_dcs_query_capture(self):
+        for block in self.generator.model.blocks:
+            if hasattr(block.self_attn, "_dcs_query_capture_list"):
+                delattr(block.self_attn, "_dcs_query_capture_list")
+
+    def _sample_dcs_query_tokens(self, query: torch.Tensor, current_num_frames: int) -> torch.Tensor:
+        if query.shape[1] <= self.query_affinity_tokens:
+            return query
+        if self.query_affinity_query_sampling != "mixed":
+            indices = torch.linspace(
+                0,
+                query.shape[1] - 1,
+                steps=self.query_affinity_tokens,
+                device=query.device,
+            ).round().long()
+            return query.index_select(1, indices)
+
+        frame_tokens = max(1, query.shape[1] // max(1, int(current_num_frames)))
+        grid_h = max(1, int(self.query_affinity_query_grid_h))
+        grid_w = max(1, int(self.query_affinity_query_grid_w))
+        if frame_tokens == self.frame_seq_length:
+            height, width = 30, 52
         else:
-            return self.generator(
-                noisy_image_or_video=noisy_image_or_video,
-                conditional_dict=conditional_dict,
-                timestep=timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-            )
+            width = max(1, int(round(frame_tokens ** 0.5)))
+            while width > 1 and frame_tokens % width != 0:
+                width -= 1
+            height = max(1, frame_tokens // width)
+        num_spatial = int(round(self.query_affinity_tokens * float(self.query_affinity_spatial_ratio)))
+        num_spatial = min(max(0, num_spatial), self.query_affinity_tokens)
+
+        spatial_indices = []
+        for t in range(int(current_num_frames)):
+            frame_offset = t * frame_tokens
+            for gh in range(grid_h):
+                h0 = (gh * height) // grid_h
+                h1 = ((gh + 1) * height) // grid_h
+                if h1 <= h0:
+                    continue
+                for gw in range(grid_w):
+                    w0 = (gw * width) // grid_w
+                    w1 = ((gw + 1) * width) // grid_w
+                    if w1 <= w0:
+                        continue
+                    h = (h0 + h1 - 1) // 2
+                    w = (w0 + w1 - 1) // 2
+                    idx = frame_offset + h * width + w
+                    if idx < query.shape[1]:
+                        spatial_indices.append(idx)
+        if num_spatial > 0 and spatial_indices:
+            spatial = torch.tensor(spatial_indices, device=query.device, dtype=torch.long).unique(sorted=True)
+            if spatial.numel() > num_spatial:
+                keep = torch.linspace(0, spatial.numel() - 1, steps=num_spatial, device=query.device).round().long()
+                spatial = spatial.index_select(0, keep)
+        else:
+            spatial = torch.empty(0, device=query.device, dtype=torch.long)
+
+        num_uniform = max(0, self.query_affinity_tokens - spatial.numel())
+        if num_uniform > 0:
+            uniform = torch.linspace(0, query.shape[1] - 1, steps=num_uniform, device=query.device).round().long()
+            indices = torch.cat([spatial, uniform]).unique(sorted=True)
+        else:
+            indices = spatial
+        if indices.numel() > self.query_affinity_tokens:
+            keep = torch.linspace(0, indices.numel() - 1, steps=self.query_affinity_tokens, device=query.device).round().long()
+            indices = indices.index_select(0, keep)
+        return query.index_select(1, indices)
+
+    def _update_query_affinity_selection(
+        self,
+        chunk_idx: int,
+        current_start_frame: int,
+        current_num_frames: int,
+    ):
+        if self.het_kv_cache is None or not self._dcs_query_capture:
+            return
+        query_by_layer = {}
+        for capture_idx, layer_idx in enumerate(self._dcs_query_capture_layers):
+            if capture_idx < len(self._dcs_query_capture):
+                query_by_layer[int(layer_idx)] = self._sample_dcs_query_tokens(
+                    self._dcs_query_capture[capture_idx],
+                    current_num_frames=current_num_frames,
+                )
+        self.het_kv_cache.select_mid_blocks_by_query(
+            query_by_layer=query_by_layer,
+            chunk_idx=chunk_idx,
+            current_start_frame=current_start_frame,
+        )
+        self._dcs_query_capture = None
+
+    def _run_generator(
+        self,
+        noisy_image_or_video,
+        conditional_dict,
+        timestep,
+        current_start_frame,
+        capture_dcs_query: bool = False,
+    ):
+        """Run generator with or without heterogeneous cache."""
+        capture_layers = set(int(i) for i in self.query_affinity_layer_ids) if capture_dcs_query else set()
+        self._dcs_query_capture_layers = sorted(capture_layers)
+        capture_list = self._set_dcs_query_capture(capture_layers) if capture_dcs_query else None
+        try:
+            if self.heterogeneous_cache_enabled and self.het_kv_cache is not None:
+                # Build per-layer mid_kv list
+                mid_kv_per_layer = []
+                for layer_idx in range(self.num_transformer_blocks):
+                    mid_kv = self.het_kv_cache.get_mid_kv(layer_idx)
+                    mid_kv_per_layer.append(mid_kv)
+
+                return self.generator(
+                    noisy_image_or_video=noisy_image_or_video,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                    mid_kv_per_layer=mid_kv_per_layer,
+                )
+            else:
+                return self.generator(
+                    noisy_image_or_video=noisy_image_or_video,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
+        finally:
+            if capture_dcs_query:
+                self._dcs_query_capture = capture_list
+                self._clear_dcs_query_capture()
 
     @torch.no_grad()
     def _project_compressed_to_kv(self, compressed_tokens):

@@ -49,6 +49,10 @@ class HeterogeneousKVCache:
         top_k_enabled: bool = False,
         top_k_blocks: int = 8,
         mid_archive_capacity_blocks: int = 64,
+        selection_strategy: str = "recency",
+        query_affinity_layer_ids: Optional[list[int]] = None,
+        query_affinity_tokens: int = 128,
+        query_affinity_prev_bonus: float = 0.05,
     ):
         self.batch_size = batch_size
         self.num_transformer_blocks = num_transformer_blocks
@@ -67,6 +71,12 @@ class HeterogeneousKVCache:
         self.top_k_enabled = top_k_enabled
         self.top_k_blocks = top_k_blocks
         self.mid_archive_capacity_blocks = mid_archive_capacity_blocks
+        self.selection_strategy = selection_strategy
+        self.query_affinity_layer_ids = query_affinity_layer_ids or []
+        self.query_affinity_tokens = query_affinity_tokens
+        self.query_affinity_prev_bonus = query_affinity_prev_bonus
+        self._selected_archive_indices_override: Optional[list[int]] = None
+        self._previous_selected_block_ids: set[int] = set()
         self._next_block_id = 0
         self._last_logged_selection = None
 
@@ -427,7 +437,7 @@ class HeterogeneousKVCache:
                     self._last_logged_selection = signature
                     self._record_debug_event(
                         "mid_select",
-                        strategy="recency",
+                        strategy=self.selection_strategy,
                         top_k_blocks=self.top_k_blocks,
                         selected_block_ids=list(signature),
                         selected_temporal_positions=[
@@ -449,6 +459,11 @@ class HeterogeneousKVCache:
     def _selected_archive_indices(self) -> list[int]:
         if not self.mid_meta:
             return []
+        if self._selected_archive_indices_override is not None:
+            return [
+                i for i in self._selected_archive_indices_override
+                if 0 <= i < len(self.mid_meta)
+            ]
         start = max(0, len(self.mid_meta) - self.top_k_blocks)
         return list(range(start, len(self.mid_meta)))
 
@@ -463,7 +478,91 @@ class HeterogeneousKVCache:
         self.rope_delta_frames = 0
         self._next_block_id = 0
         self._last_logged_selection = None
+        self._selected_archive_indices_override = None
+        self._previous_selected_block_ids = set()
         # Don't zero mid_kv_buffers tensors; next writes will overwrite
+
+    def select_mid_blocks_by_query(
+        self,
+        query_by_layer: dict[int, torch.Tensor],
+        chunk_idx: int,
+        current_start_frame: int,
+    ) -> None:
+        """Select active archive blocks by current-query affinity to compressed K."""
+        if not self.top_k_enabled or self.selection_strategy != "query_affinity":
+            return
+        if not self.mid_meta or not query_by_layer:
+            self._selected_archive_indices_override = None
+            return
+
+        layer_ids = [
+            layer_idx for layer_idx in self.query_affinity_layer_ids
+            if layer_idx in query_by_layer and layer_idx < self.num_transformer_blocks
+        ]
+        if not layer_ids:
+            layer_ids = [
+                layer_idx for layer_idx in sorted(query_by_layer)
+                if layer_idx < self.num_transformer_blocks
+            ]
+        if not layer_ids:
+            self._selected_archive_indices_override = None
+            return
+
+        scores = []
+        for block_idx, meta in enumerate(self.mid_meta):
+            per_layer_scores = []
+            for layer_idx in layer_ids:
+                q = query_by_layer[layer_idx]
+                if q.shape[1] > self.query_affinity_tokens:
+                    q_idx = torch.linspace(
+                        0, q.shape[1] - 1,
+                        steps=self.query_affinity_tokens,
+                        device=q.device,
+                    ).round().long()
+                    q = q.index_select(1, q_idx)
+                k = self.mid_archive_kv[block_idx][layer_idx][0]
+                affinity = torch.einsum(
+                    "bqhd,bnhd->bqhn",
+                    q.float(),
+                    k.float(),
+                ) / (self.head_dim ** 0.5)
+                per_layer_scores.append(affinity.amax(dim=-1).mean())
+            score = torch.stack(per_layer_scores).mean()
+            if meta.block_id in self._previous_selected_block_ids:
+                score = score + float(self.query_affinity_prev_bonus)
+            scores.append(score)
+
+        score_tensor = torch.stack(scores)
+        top_k = min(int(self.top_k_blocks), score_tensor.numel())
+        if top_k <= 0:
+            self._selected_archive_indices_override = None
+            return
+        selected_score_values, selected_score_indices = torch.topk(score_tensor, k=top_k)
+        selected = sorted(selected_score_indices.detach().cpu().tolist())
+        selected_block_ids = [self.mid_meta[i].block_id for i in selected]
+        selected_scores = [float(score_tensor[i].detach().cpu().item()) for i in selected]
+        overlap_with_previous = len(set(selected_block_ids) & self._previous_selected_block_ids)
+        self._selected_archive_indices_override = selected
+        self._previous_selected_block_ids = set(selected_block_ids)
+        self._last_logged_selection = None
+        self.mid_token_count = self._selected_mid_token_count()
+
+        self._record_debug_event(
+            "query_affinity_dcs",
+            chunk_idx=chunk_idx,
+            current_start_frame=current_start_frame,
+            selected_blocks=selected_block_ids,
+            selected_temporal_positions=[self.mid_meta[i].temporal_position for i in selected],
+            selected_n_tokens=[self.mid_meta[i].n_tokens for i in selected],
+            scores=selected_scores,
+            archive_size=len(self.mid_meta),
+            archive_total_tokens=self._archive_total_tokens(),
+            top_k=top_k,
+            layer_ids=layer_ids,
+            query_tokens=self.query_affinity_tokens,
+            prev_bonus=float(self.query_affinity_prev_bonus),
+            overlap_with_previous=overlap_with_previous,
+        )
 
     # ------------------------------------------------------------------
     # Compatibility with existing layer_cache interface
