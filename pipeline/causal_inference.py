@@ -93,6 +93,11 @@ class CausalInferencePipeline(torch.nn.Module):
             self.query_affinity_spatial_ratio = getattr(top_k_cfg, "query_affinity_spatial_ratio", 0.5)
             self.query_affinity_query_grid_h = getattr(top_k_cfg, "query_affinity_query_grid_h", 3)
             self.query_affinity_query_grid_w = getattr(top_k_cfg, "query_affinity_query_grid_w", 3)
+            self.query_affinity_top_pool_ratio = getattr(top_k_cfg, "query_affinity_top_pool_ratio", 0.05)
+            self.query_affinity_min_pool_tokens = getattr(top_k_cfg, "query_affinity_min_pool_tokens", 4)
+            self.query_affinity_keep_previous_blocks = getattr(top_k_cfg, "query_affinity_keep_previous_blocks", 0)
+            self.query_affinity_replace_margin = getattr(top_k_cfg, "query_affinity_replace_margin", 0.0)
+            self.query_affinity_max_age_blocks = getattr(top_k_cfg, "query_affinity_max_age_blocks", 0)
             print(f"Heterogeneous KV cache enabled: Nsink={het_cfg.Nsink}, "
                   f"Nrecent={het_cfg.Nrecent}, Nmid_tokens={het_cfg.Nmid_tokens}")
 
@@ -498,6 +503,11 @@ class CausalInferencePipeline(torch.nn.Module):
             query_affinity_layer_ids=self.query_affinity_layer_ids,
             query_affinity_tokens=self.query_affinity_tokens,
             query_affinity_prev_bonus=self.query_affinity_prev_bonus,
+            query_affinity_top_pool_ratio=self.query_affinity_top_pool_ratio,
+            query_affinity_min_pool_tokens=self.query_affinity_min_pool_tokens,
+            query_affinity_keep_previous_blocks=self.query_affinity_keep_previous_blocks,
+            query_affinity_replace_margin=self.query_affinity_replace_margin,
+            query_affinity_max_age_blocks=self.query_affinity_max_age_blocks,
         )
         if self.cache_debug_logger is not None:
             self.het_kv_cache.set_debug_logger(self.cache_debug_logger)

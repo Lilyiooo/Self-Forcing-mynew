@@ -621,6 +621,63 @@ class Trainer:
             spatial_ratio=spatial_ratio,
         )
 
+    def _multi_context_replacement_attn_loss(
+        self,
+        query,
+        teacher_context,
+        replacements,
+        num_query_tokens: int,
+        query_grid_shape=None,
+        query_sampling: str = "uniform",
+        query_grid_h: int = 4,
+        query_grid_w: int = 4,
+        spatial_ratio: float = 0.5,
+    ):
+        """Match future attention when multiple context spans are compressed."""
+        if not replacements:
+            return None
+        context_k = teacher_context["k"]
+        context_v = teacher_context["v"]
+        context_start = int(teacher_context.get("context_start", 0))
+
+        spans = []
+        for item in replacements:
+            target_start = int(item["target_start_token"]) - context_start
+            target_end = target_start + int(item["target_num_tokens"])
+            if target_start < 0 or target_end > context_k.shape[1] or target_start >= target_end:
+                return None
+            spans.append((target_start, target_end, item["student_k"], item["student_v"]))
+        spans.sort(key=lambda x: x[0])
+        for prev, curr in zip(spans, spans[1:]):
+            if curr[0] < prev[1]:
+                return None
+
+        k_parts = []
+        v_parts = []
+        cursor = 0
+        for target_start, target_end, student_k, student_v in spans:
+            k_parts.append(context_k[:, cursor:target_start].detach())
+            v_parts.append(context_v[:, cursor:target_start].detach())
+            k_parts.append(student_k)
+            v_parts.append(student_v)
+            cursor = target_end
+        k_parts.append(context_k[:, cursor:].detach())
+        v_parts.append(context_v[:, cursor:].detach())
+
+        return self._attention_output_distill_loss(
+            query=query,
+            teacher_k=context_k,
+            teacher_v=context_v,
+            student_k=torch.cat(k_parts, dim=1),
+            student_v=torch.cat(v_parts, dim=1),
+            num_query_tokens=num_query_tokens,
+            query_grid_shape=query_grid_shape,
+            query_sampling=query_sampling,
+            query_grid_h=query_grid_h,
+            query_grid_w=query_grid_w,
+            spatial_ratio=spatial_ratio,
+        )
+
     def _load_kv_distill_prompts(self, prompt_path: str):
         if not prompt_path:
             return []
@@ -681,6 +738,7 @@ class Trainer:
         target_block_index: int,
         future_gap_blocks: int,
         generator_model,
+        target_block_indices=None,
     ):
         """Generate short AR cache history and return a past block plus future-query captures."""
         frame_seq_length = (latent_h // 2) * (latent_w // 2)
@@ -695,15 +753,21 @@ class Trainer:
             device=self.device,
         )
 
-        target_block = None
-        target_kv = None
-        target_attn = None
+        if target_block_indices is None:
+            target_block_indices = [int(target_block_index)]
+        target_block_indices = sorted(set(int(i) for i in target_block_indices))
+        target_block_set = set(target_block_indices)
+        primary_target_index = int(target_block_indices[-1])
+
+        target_blocks = {}
+        target_kvs = {}
+        target_attns = {}
         future_attn = None
         future_context = None
         current_start_frame = 0
         future_block_index = min(
             rollout_blocks - 1,
-            target_block_index + max(1, int(future_gap_blocks)),
+            primary_target_index + max(1, int(future_gap_blocks)),
         )
 
         for block_idx in range(rollout_blocks):
@@ -744,7 +808,7 @@ class Trainer:
             )
             captured_kv = []
             captured_attn = []
-            if block_idx == target_block_index:
+            if block_idx in target_block_set:
                 self._set_kv_capture(captured_kv)
                 self._set_attn_distill_capture(captured_attn)
             try:
@@ -760,26 +824,32 @@ class Trainer:
                 self._clear_kv_capture()
                 self._clear_attn_distill_capture()
 
-            if block_idx == target_block_index:
-                target_block = pred_x0.detach()
-                target_kv = captured_kv
-                target_attn = captured_attn
+            if block_idx in target_block_set:
+                target_blocks[block_idx] = pred_x0.detach()
+                target_kvs[block_idx] = captured_kv
+                target_attns[block_idx] = captured_attn
 
             current_start_frame += latent_t
 
-        if target_block is None or not target_kv:
+        if not target_blocks:
             raise RuntimeError("AR rollout distill failed to capture target block KV.")
         if future_attn is None or not future_attn:
-            future_attn = target_attn
+            future_attn = target_attns[target_block_indices[-1]]
 
         del kv_cache, crossattn_cache
+        ordered_indices = [idx for idx in target_block_indices if idx in target_blocks and target_kvs.get(idx)]
+        if not ordered_indices:
+            raise RuntimeError("AR rollout distill failed to capture any non-empty target KV.")
         return (
-            target_block.permute(0, 2, 1, 3, 4).contiguous(),
-            target_kv,
-            target_attn,
+            [
+                target_blocks[idx].permute(0, 2, 1, 3, 4).contiguous()
+                for idx in ordered_indices
+            ],
+            [target_kvs[idx] for idx in ordered_indices],
+            [target_attns[idx] for idx in ordered_indices],
             future_attn,
             future_context,
-            target_block_index * latent_t,
+            [idx * latent_t for idx in ordered_indices],
         )
 
     def pretrain_compressor_kv_distill(self, num_steps=0):
@@ -839,6 +909,12 @@ class Trainer:
         prompt_pool = self._load_kv_distill_prompts(prompt_path) if use_real_prompts else []
         rollout_blocks = getattr(compressor_train_cfg, "kv_distill_rollout_blocks", 4)
         random_target = getattr(compressor_train_cfg, "kv_distill_random_target", False)
+        num_replaced_blocks = max(1, int(getattr(
+            compressor_train_cfg, "kv_distill_num_replaced_blocks", 1
+        )))
+        replace_min_gap_blocks = max(1, int(getattr(
+            compressor_train_cfg, "kv_distill_replace_min_gap_blocks", 1
+        )))
         target_block_index = getattr(
             compressor_train_cfg,
             "kv_distill_target_block_index",
@@ -903,7 +979,9 @@ class Trainer:
                 f"rollout_blocks={rollout_blocks}, target_block_index={target_block_index}, "
                 f"random_target={random_target}, future_gap_min={future_gap_min}, "
                 f"future_gap_max={future_gap_max}, future_gap_blocks={future_gap_blocks}, "
-                f"future_block_index={future_block_index}"
+                f"future_block_index={future_block_index}, "
+                f"num_replaced_blocks={num_replaced_blocks}, "
+                f"replace_min_gap_blocks={replace_min_gap_blocks}"
             )
 
         self.compressor.train()
@@ -928,6 +1006,10 @@ class Trainer:
                     captured_attn = []
                     captured_query_attn = captured_attn
                     captured_query_context = None
+                    target_blocks = [z_c_first]
+                    captured_kvs = [captured_kv]
+                    captured_attns = [captured_attn]
+                    rope_start_frames = [rope_start_frame]
                 elif latent_source == "denoised":
                     noisy_z_btc = torch.randn(
                         batch_size, latent_t, in_ch, latent_h, latent_w,
@@ -952,9 +1034,14 @@ class Trainer:
                     captured_attn = []
                     captured_query_attn = captured_attn
                     captured_query_context = None
+                    target_blocks = [z_c_first]
+                    captured_kvs = [captured_kv]
+                    captured_attns = [captured_attn]
+                    rope_start_frames = [rope_start_frame]
                 elif latent_source == "ar_rollout":
                     effective_future_gap_blocks = future_gap_blocks
                     effective_target_block_index = target_block_index
+                    effective_target_block_indices = [target_block_index]
                     if random_target:
                         if future_gap_max > future_gap_min:
                             effective_future_gap_blocks = int(torch.randint(
@@ -977,13 +1064,45 @@ class Trainer:
                             ).item())
                         else:
                             effective_target_block_index = min_target_block
+                    primary_target_block = int(effective_target_block_index)
+                    future_block_for_targets = min(
+                        rollout_blocks - 1,
+                        primary_target_block + int(effective_future_gap_blocks),
+                    )
+                    candidate_targets = list(range(0, max(0, future_block_for_targets)))
+                    if random_target and candidate_targets:
+                        sink_blocks = max(0, int(nsink) // max(1, int(latent_t)))
+                        candidate_targets = [
+                            idx for idx in candidate_targets
+                            if idx >= min(sink_blocks, max(candidate_targets))
+                        ] or candidate_targets
+                    effective_target_block_indices = [primary_target_block]
+                    if num_replaced_blocks > 1 and candidate_targets:
+                        valid_extra = [
+                            idx for idx in candidate_targets
+                            if idx < primary_target_block
+                            and primary_target_block - idx >= replace_min_gap_blocks
+                        ]
+                        if len(valid_extra) < num_replaced_blocks - 1:
+                            valid_extra = [
+                                idx for idx in candidate_targets
+                                if idx != primary_target_block
+                                and abs(idx - primary_target_block) >= replace_min_gap_blocks
+                            ]
+                        if len(valid_extra) < num_replaced_blocks - 1:
+                            valid_extra = [idx for idx in candidate_targets if idx != primary_target_block]
+                        if valid_extra:
+                            perm = torch.randperm(len(valid_extra), device=self.device)
+                            for perm_idx in perm[: max(0, num_replaced_blocks - 1)].detach().cpu().tolist():
+                                effective_target_block_indices.append(valid_extra[int(perm_idx)])
+                    effective_target_block_indices = sorted(set(effective_target_block_indices))
                     (
-                        z_c_first,
-                        captured_kv,
-                        captured_attn,
+                        target_blocks,
+                        captured_kvs,
+                        captured_attns,
                         captured_query_attn,
                         captured_query_context,
-                        rope_start_frame,
+                        rope_start_frames,
                     ) = self._sample_ar_rollout_distill_block(
                         conditional_dict=conditional_dict,
                         batch_size=batch_size,
@@ -999,7 +1118,9 @@ class Trainer:
                         target_block_index=effective_target_block_index,
                         future_gap_blocks=effective_future_gap_blocks,
                         generator_model=generator_model,
+                        target_block_indices=effective_target_block_indices,
                     )
+                    z_c_first = torch.cat(target_blocks, dim=0)
                     z_btc = None
                 else:
                     raise ValueError(
@@ -1023,6 +1144,10 @@ class Trainer:
                     finally:
                         self._clear_kv_capture()
                         self._clear_attn_distill_capture()
+                    target_blocks = [z_c_first]
+                    captured_kvs = [captured_kv]
+                    captured_attns = [captured_attn]
+                    rope_start_frames = [rope_start_frame]
 
             compressed_tokens, _ = self.compressor(z_c_first, density_level)
             student_kv = self.compressor.project_to_kv(
@@ -1033,46 +1158,72 @@ class Trainer:
             target_grid = self.compressor.compressed_grid_shape(
                 density_level, (latent_t, latent_h, latent_w)
             )
-            student_roped_kv = [
-                torch.stack([
-                    apply_temporal_rope_to_unrotated(
-                        kv[0],
-                        freqs=generator_model.freqs,
-                        start_frame=rope_start_frame,
-                        grid_shape=target_grid,
-                        temporal_stride=2,
-                    ),
-                    kv[1],
-                ], dim=0)
-                for kv in student_kv
-            ]
+            num_targets = max(1, len(captured_kvs))
+            student_kv_by_target = []
+            student_roped_kv_by_target = []
+            for target_idx in range(num_targets):
+                start = target_idx * batch_size
+                end = start + batch_size
+                per_target_kv = [
+                    torch.stack([kv[0][start:end], kv[1][start:end]], dim=0)
+                    for kv in student_kv
+                ]
+                student_kv_by_target.append(per_target_kv)
+                target_rope_start = int(rope_start_frames[target_idx])
+                student_roped_kv_by_target.append([
+                    torch.stack([
+                        apply_temporal_rope_to_unrotated(
+                            kv[0],
+                            freqs=generator_model.freqs,
+                            start_frame=target_rope_start,
+                            grid_shape=target_grid,
+                            temporal_stride=2,
+                        ),
+                        kv[1],
+                    ], dim=0)
+                    for kv in per_target_kv
+                ])
 
             full_grid = (latent_t, latent_h // 2, latent_w // 2)
             loss = torch.tensor(0.0, device=self.device)
-            used_layers = min(len(captured_kv), num_layers)
+            used_layers = min(
+                min(len(kv_items) for kv_items in captured_kvs),
+                num_layers,
+            )
             attn_layer_ids = set(self._select_distill_layers(used_layers, attn_max_layers))
             context_replacement_used = 0
             context_replacement_fallback = 0
             attn_loss_skipped = 0
-            for layer_idx, captured_item in enumerate(captured_kv[:used_layers]):
-                teacher_k, teacher_v = captured_item
-                target_k = self._pool_teacher_kv_to_grid(teacher_k, full_grid, target_grid)
-                target_v = self._pool_teacher_kv_to_grid(teacher_v, full_grid, target_grid)
-                pred_k, pred_v = student_kv[layer_idx][0], student_kv[layer_idx][1]
-                layer_loss = k_weight * F.mse_loss(pred_k.float(), target_k.float())
-                layer_loss = layer_loss + v_weight * F.mse_loss(pred_v.float(), target_v.float())
-                layer_loss = layer_loss + cosine_weight * (
-                    1 - F.cosine_similarity(pred_k.float(), target_k.float(), dim=-1).mean()
-                    + 1 - F.cosine_similarity(pred_v.float(), target_v.float(), dim=-1).mean()
-                )
+            for layer_idx in range(used_layers):
+                layer_loss = torch.tensor(0.0, device=self.device)
+                valid_targets_for_layer = 0
+                for target_idx in range(num_targets):
+                    if layer_idx >= len(captured_kvs[target_idx]):
+                        continue
+                    teacher_k, teacher_v = captured_kvs[target_idx][layer_idx]
+                    target_k = self._pool_teacher_kv_to_grid(teacher_k, full_grid, target_grid)
+                    target_v = self._pool_teacher_kv_to_grid(teacher_v, full_grid, target_grid)
+                    pred_k = student_kv_by_target[target_idx][layer_idx][0]
+                    pred_v = student_kv_by_target[target_idx][layer_idx][1]
+                    target_loss = k_weight * F.mse_loss(pred_k.float(), target_k.float())
+                    target_loss = target_loss + v_weight * F.mse_loss(pred_v.float(), target_v.float())
+                    target_loss = target_loss + cosine_weight * (
+                        1 - F.cosine_similarity(pred_k.float(), target_k.float(), dim=-1).mean()
+                        + 1 - F.cosine_similarity(pred_v.float(), target_v.float(), dim=-1).mean()
+                    )
+                    layer_loss = layer_loss + target_loss
+                    valid_targets_for_layer += 1
+                layer_loss = layer_loss / max(1, valid_targets_for_layer)
+
                 if (
                     (attn_output_weight > 0 or context_weight > 0)
                     and layer_idx in attn_layer_ids
-                    and layer_idx < len(captured_attn)
+                    and captured_attns
+                    and layer_idx < len(captured_attns[0])
                     and layer_idx < len(captured_query_attn)
                 ):
                     teacher_q = captured_query_attn[layer_idx][0]
-                    _, teacher_roped_k, teacher_attn_v = captured_attn[layer_idx]
+                    _, teacher_roped_k, teacher_attn_v = captured_attns[0][layer_idx]
                     attn_loss = None
                     attn_loss_weight = attn_output_weight
                     attempted_context_replacement = False
@@ -1083,13 +1234,21 @@ class Trainer:
                         and layer_idx < len(captured_query_context)
                     ):
                         attempted_context_replacement = True
-                        attn_loss = self._context_replacement_attn_loss(
+                        replacements = []
+                        target_num_tokens = latent_t * (latent_h // 2) * (latent_w // 2)
+                        for target_idx in range(num_targets):
+                            if layer_idx >= len(student_roped_kv_by_target[target_idx]):
+                                continue
+                            replacements.append({
+                                "student_k": student_roped_kv_by_target[target_idx][layer_idx][0],
+                                "student_v": student_roped_kv_by_target[target_idx][layer_idx][1],
+                                "target_start_token": int(rope_start_frames[target_idx]) * (latent_h // 2) * (latent_w // 2),
+                                "target_num_tokens": target_num_tokens,
+                            })
+                        attn_loss = self._multi_context_replacement_attn_loss(
                             query=teacher_q,
                             teacher_context=captured_query_context[layer_idx],
-                            student_k=student_roped_kv[layer_idx][0],
-                            student_v=student_roped_kv[layer_idx][1],
-                            target_start_token=rope_start_frame * (latent_h // 2) * (latent_w // 2),
-                            target_num_tokens=latent_t * (latent_h // 2) * (latent_w // 2),
+                            replacements=replacements,
                             num_query_tokens=attn_query_tokens,
                             query_grid_shape=full_grid,
                             query_sampling=query_sampling,
@@ -1105,8 +1264,8 @@ class Trainer:
                             teacher_q,
                             teacher_roped_k,
                             teacher_attn_v,
-                            student_roped_kv[layer_idx][0],
-                            student_roped_kv[layer_idx][1],
+                            student_roped_kv_by_target[0][layer_idx][0],
+                            student_roped_kv_by_target[0][layer_idx][1],
                             num_query_tokens=attn_query_tokens,
                             query_grid_shape=full_grid,
                             query_sampling=query_sampling,
@@ -1133,6 +1292,7 @@ class Trainer:
             if step_idx % 10 == 0 and self.is_main_process:
                 print(
                     f"  KV distill step {step_idx}/{num_steps}, loss={loss.item():.6f}, "
+                    f"targets={num_targets}, target_starts={rope_start_frames}, "
                     f"context_used={context_replacement_used}, "
                     f"context_fallback={context_replacement_fallback}, "
                     f"attn_skipped={attn_loss_skipped}"

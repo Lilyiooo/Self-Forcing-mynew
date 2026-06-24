@@ -10,6 +10,7 @@ Eviction is density-aware: lowest density blocks are evicted first.
 """
 
 import torch
+import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional
 
@@ -53,6 +54,11 @@ class HeterogeneousKVCache:
         query_affinity_layer_ids: Optional[list[int]] = None,
         query_affinity_tokens: int = 128,
         query_affinity_prev_bonus: float = 0.05,
+        query_affinity_top_pool_ratio: float = 0.05,
+        query_affinity_min_pool_tokens: int = 4,
+        query_affinity_keep_previous_blocks: int = 0,
+        query_affinity_replace_margin: float = 0.0,
+        query_affinity_max_age_blocks: int = 0,
     ):
         self.batch_size = batch_size
         self.num_transformer_blocks = num_transformer_blocks
@@ -75,6 +81,11 @@ class HeterogeneousKVCache:
         self.query_affinity_layer_ids = query_affinity_layer_ids or []
         self.query_affinity_tokens = query_affinity_tokens
         self.query_affinity_prev_bonus = query_affinity_prev_bonus
+        self.query_affinity_top_pool_ratio = query_affinity_top_pool_ratio
+        self.query_affinity_min_pool_tokens = query_affinity_min_pool_tokens
+        self.query_affinity_keep_previous_blocks = query_affinity_keep_previous_blocks
+        self.query_affinity_replace_margin = query_affinity_replace_margin
+        self.query_affinity_max_age_blocks = query_affinity_max_age_blocks
         self._selected_archive_indices_override: Optional[list[int]] = None
         self._previous_selected_block_ids: set[int] = set()
         self._next_block_id = 0
@@ -508,8 +519,20 @@ class HeterogeneousKVCache:
             self._selected_archive_indices_override = None
             return
 
+        max_age_blocks = int(self.query_affinity_max_age_blocks)
+        if max_age_blocks > 0:
+            candidate_start = max(0, len(self.mid_meta) - max_age_blocks)
+            candidate_indices = list(range(candidate_start, len(self.mid_meta)))
+        else:
+            candidate_start = 0
+            candidate_indices = list(range(len(self.mid_meta)))
+        if not candidate_indices:
+            self._selected_archive_indices_override = None
+            return
+
         scores = []
-        for block_idx, meta in enumerate(self.mid_meta):
+        for block_idx in candidate_indices:
+            meta = self.mid_meta[block_idx]
             per_layer_scores = []
             for layer_idx in layer_ids:
                 q = query_by_layer[layer_idx]
@@ -521,26 +544,78 @@ class HeterogeneousKVCache:
                     ).round().long()
                     q = q.index_select(1, q_idx)
                 k = self.mid_archive_kv[block_idx][layer_idx][0]
+                q = F.normalize(q.float(), dim=-1)
+                k = F.normalize(k.float(), dim=-1)
                 affinity = torch.einsum(
                     "bqhd,bnhd->bqhn",
-                    q.float(),
-                    k.float(),
-                ) / (self.head_dim ** 0.5)
-                per_layer_scores.append(affinity.amax(dim=-1).mean())
+                    q,
+                    k,
+                )
+                pool_tokens = max(
+                    int(self.query_affinity_min_pool_tokens),
+                    int(round(k.shape[1] * float(self.query_affinity_top_pool_ratio))),
+                )
+                pool_tokens = min(max(1, pool_tokens), k.shape[1])
+                per_token_scores = affinity.topk(k=pool_tokens, dim=-1).values
+                per_layer_scores.append(per_token_scores.mean())
             score = torch.stack(per_layer_scores).mean()
             if meta.block_id in self._previous_selected_block_ids:
                 score = score + float(self.query_affinity_prev_bonus)
             scores.append(score)
 
         score_tensor = torch.stack(scores)
-        top_k = min(int(self.top_k_blocks), score_tensor.numel())
+        score_by_index = {
+            block_idx: score_tensor[pos]
+            for pos, block_idx in enumerate(candidate_indices)
+        }
+        top_k = min(int(self.top_k_blocks), len(candidate_indices))
         if top_k <= 0:
             self._selected_archive_indices_override = None
             return
-        selected_score_values, selected_score_indices = torch.topk(score_tensor, k=top_k)
-        selected = sorted(selected_score_indices.detach().cpu().tolist())
+        ranked_positions = torch.argsort(score_tensor, descending=True).detach().cpu().tolist()
+        ranked = [candidate_indices[pos] for pos in ranked_positions]
+        selected: list[int] = []
+
+        keep_previous = min(int(self.query_affinity_keep_previous_blocks), top_k)
+        if keep_previous > 0 and self._previous_selected_block_ids:
+            previous_indices = [
+                i for i in candidate_indices
+                if self.mid_meta[i].block_id in self._previous_selected_block_ids
+            ]
+            previous_indices = sorted(
+                previous_indices,
+                key=lambda i: float(score_by_index[i].detach().cpu().item()),
+                reverse=True,
+            )
+            selected.extend(previous_indices[:keep_previous])
+
+        replace_margin = float(self.query_affinity_replace_margin)
+        for idx in ranked:
+            if len(selected) >= top_k:
+                break
+            if idx in selected:
+                continue
+            if replace_margin > 0 and keep_previous > 0 and selected:
+                previous_selected = [
+                    i for i in selected
+                    if self.mid_meta[i].block_id in self._previous_selected_block_ids
+                ]
+                if len(previous_selected) >= keep_previous:
+                    min_prev_score = min(score_by_index[i] for i in previous_selected)
+                    if score_by_index[idx] <= min_prev_score + replace_margin:
+                        continue
+            selected.append(idx)
+
+        if len(selected) < top_k:
+            for idx in ranked:
+                if len(selected) >= top_k:
+                    break
+                if idx not in selected:
+                    selected.append(idx)
+
+        selected = sorted(selected)
         selected_block_ids = [self.mid_meta[i].block_id for i in selected]
-        selected_scores = [float(score_tensor[i].detach().cpu().item()) for i in selected]
+        selected_scores = [float(score_by_index[i].detach().cpu().item()) for i in selected]
         overlap_with_previous = len(set(selected_block_ids) & self._previous_selected_block_ids)
         self._selected_archive_indices_override = selected
         self._previous_selected_block_ids = set(selected_block_ids)
@@ -561,6 +636,15 @@ class HeterogeneousKVCache:
             layer_ids=layer_ids,
             query_tokens=self.query_affinity_tokens,
             prev_bonus=float(self.query_affinity_prev_bonus),
+            top_pool_ratio=float(self.query_affinity_top_pool_ratio),
+            min_pool_tokens=int(self.query_affinity_min_pool_tokens),
+            keep_previous_blocks=int(self.query_affinity_keep_previous_blocks),
+            replace_margin=float(self.query_affinity_replace_margin),
+            max_age_blocks=max_age_blocks,
+            candidate_start_index=candidate_start,
+            candidate_archive_size=len(candidate_indices),
+            candidate_block_id_min=self.mid_meta[candidate_indices[0]].block_id,
+            candidate_block_id_max=self.mid_meta[candidate_indices[-1]].block_id,
             overlap_with_previous=overlap_with_previous,
         )
 
