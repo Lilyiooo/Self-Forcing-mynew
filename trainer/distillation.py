@@ -912,8 +912,14 @@ class Trainer:
         num_replaced_blocks = max(1, int(getattr(
             compressor_train_cfg, "kv_distill_num_replaced_blocks", 1
         )))
+        multi_target_prob = float(getattr(
+            compressor_train_cfg, "kv_distill_multi_target_prob", 1.0
+        ))
         replace_min_gap_blocks = max(1, int(getattr(
             compressor_train_cfg, "kv_distill_replace_min_gap_blocks", 1
+        )))
+        replace_max_gap_blocks = max(replace_min_gap_blocks, int(getattr(
+            compressor_train_cfg, "kv_distill_replace_max_gap_blocks", 3
         )))
         target_block_index = getattr(
             compressor_train_cfg,
@@ -981,7 +987,9 @@ class Trainer:
                 f"future_gap_max={future_gap_max}, future_gap_blocks={future_gap_blocks}, "
                 f"future_block_index={future_block_index}, "
                 f"num_replaced_blocks={num_replaced_blocks}, "
-                f"replace_min_gap_blocks={replace_min_gap_blocks}"
+                f"multi_target_prob={multi_target_prob}, "
+                f"replace_min_gap_blocks={replace_min_gap_blocks}, "
+                f"replace_max_gap_blocks={replace_max_gap_blocks}"
             )
 
         self.compressor.train()
@@ -1076,12 +1084,18 @@ class Trainer:
                             idx for idx in candidate_targets
                             if idx >= min(sink_blocks, max(candidate_targets))
                         ] or candidate_targets
+                    use_multi_target = (
+                        num_replaced_blocks > 1
+                        and candidate_targets
+                        and float(torch.rand((), device=self.device).item()) < multi_target_prob
+                    )
                     effective_target_block_indices = [primary_target_block]
-                    if num_replaced_blocks > 1 and candidate_targets:
+                    if use_multi_target:
                         valid_extra = [
                             idx for idx in candidate_targets
                             if idx < primary_target_block
                             and primary_target_block - idx >= replace_min_gap_blocks
+                            and primary_target_block - idx <= replace_max_gap_blocks
                         ]
                         if len(valid_extra) < num_replaced_blocks - 1:
                             valid_extra = [
