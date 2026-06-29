@@ -1,0 +1,117 @@
+generator_ckpt: /inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew/checkpoints/ode_init.pt
+compressor_ckpt: ${oc.env:COMPRESSOR_CKPT}
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-1.3B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+lr_critic: 1.0e-06
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+data_path: /inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew/prompts/vidprom_filtered_extended.txt
+batch_size: 1
+ema_weight: 0.0
+ema_start_step: 999999
+total_batch_size: 64
+log_iters: 250
+negative_prompt: 色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 20
+- 16
+- 60
+- 104
+distribution_loss: dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 4
+load_raw_video: false
+num_training_frames: 20
+model_kwargs:
+  timestep_shift: 5.0
+heterogeneous_cache:
+  enabled: true
+  Nsink: 8
+  Nrecent: 4
+  Nmid_tokens: 300
+  mid_scale: 1.0
+  eviction_policy: fifo
+  debug_log_cache: true
+  debug_log_print: false
+density_estimator:
+  delta_high: 1.1
+  delta_low: -0.1
+  motion_weight: 0.7
+  complexity_weight: 0.3
+compressor:
+  d_model: 1536
+  in_ch: 16
+top_k:
+  enabled: false
+  top_k_tokens: 1000
+compressor_training:
+  pretrain_epochs: 0
+  pretrain_lr: 0.001
+  pretrain_batch_size: 2
+  kv_distill_steps: 300
+  kv_distill_lr: 2.0e-5
+  kv_distill_batch_size: 1
+  kv_distill_density_level: mid
+  kv_distill_k_weight: 1.0
+  kv_distill_v_weight: 1.0
+  kv_distill_cosine_weight: 0.1
+  kv_distill_attn_output_weight: 0.01
+  kv_distill_context_weight: 0.01
+  kv_distill_attn_context_replacement: true
+  kv_distill_query_sampling: mixed
+  kv_distill_spatial_ratio: 0.4
+  kv_distill_query_grid_h: 3
+  kv_distill_query_grid_w: 3
+  kv_distill_attn_query_tokens: 128
+  kv_distill_attn_max_layers: 8
+  kv_distill_latent_source: ar_rollout
+  kv_distill_denoise_timestep: 750
+  kv_distill_use_real_prompts: true
+  kv_distill_prompt_path: /inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew/prompts/vidprom_filtered_extended.txt
+  kv_distill_rollout_blocks: 8
+  kv_distill_random_target: true
+  kv_distill_target_block_index: 2
+  kv_distill_future_gap_blocks: 2
+  kv_distill_future_gap_min: 2
+  kv_distill_future_gap_max: 4
+  kv_distill_num_replaced_blocks: 1
+  kv_distill_multi_target_prob: 0.0
+  kv_distill_mid_scale_min: 0.5
+  kv_distill_mid_scale_max: 1.0
+  lambda_recon: 0.0
+  warmup_steps: 100
+  end_to_end: false
+  compressor_lr: 0.0001
+  compressor_grad_clip: 1.0
+val_num_latent_frames: 240
+prompt_path: /inspire/qb-ilm/project/exploration-topic/wangqiqi-CZXS25210124/Self-Forcing-mynew/prompts/validation_60s.txt
+num_val_prompts: 2
+max_train_steps: 1000
+validate_on_save: false

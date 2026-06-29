@@ -98,8 +98,10 @@ class CausalInferencePipeline(torch.nn.Module):
             self.query_affinity_keep_previous_blocks = getattr(top_k_cfg, "query_affinity_keep_previous_blocks", 0)
             self.query_affinity_replace_margin = getattr(top_k_cfg, "query_affinity_replace_margin", 0.0)
             self.query_affinity_max_age_blocks = getattr(top_k_cfg, "query_affinity_max_age_blocks", 0)
+            self.mid_kv_scale = float(getattr(het_cfg, "mid_scale", 1.0))
             print(f"Heterogeneous KV cache enabled: Nsink={het_cfg.Nsink}, "
-                  f"Nrecent={het_cfg.Nrecent}, Nmid_tokens={het_cfg.Nmid_tokens}")
+                  f"Nrecent={het_cfg.Nrecent}, Nmid_tokens={het_cfg.Nmid_tokens}, "
+                  f"mid_scale={self.mid_kv_scale}")
 
             # Density estimator
             density_cfg = getattr(args, "density_estimator", None)
@@ -109,6 +111,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 motion_weight=getattr(density_cfg, "motion_weight", 0.6),
                 complexity_weight=getattr(density_cfg, "complexity_weight", 0.4),
             )
+            self.routing_override = getattr(density_cfg, "routing_override", "normal")
 
             # Compressor (will be initialized lazily on first device placement)
             self.compressor = None
@@ -664,6 +667,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                     mid_kv_per_layer=mid_kv_per_layer,
+                    mid_kv_scale=self.mid_kv_scale,
                 )
             else:
                 return self.generator(
@@ -753,6 +757,23 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Estimate density (v2: single call, no dependency on z_prev or LR complexity)
         density_level, density_score, density_info = self.density_estimator(z_compress)
+        predicted_density_level = density_level
+        if self.routing_override == "inverse":
+            if density_level == "high":
+                density_level = "low"
+            elif density_level == "low":
+                density_level = "high"
+        elif self.routing_override == "all_mid":
+            density_level = "mid"
+        elif self.routing_override == "all_high":
+            density_level = "high"
+        elif self.routing_override == "all_low":
+            density_level = "low"
+        elif self.routing_override != "normal":
+            raise ValueError(
+                f"Unsupported density_estimator.routing_override={self.routing_override!r}; "
+                "expected normal/inverse/all_mid/all_high/all_low."
+            )
 
         # Compress: need latent in (B, C, T, H, W) format for compressor
         compressed_tokens, _complexity_from_lr = self.compressor(z_compress, density_level)
@@ -785,6 +806,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 block_start=current_start_frame,
                 block_end=current_start_frame + denoised_pred.shape[1],
                 density_level=density_level,
+                predicted_density_level=predicted_density_level,
+                routing_override=self.routing_override,
                 density_score=float(density_score),
                 n_tokens=inserted_tokens,
                 raw_n_tokens=N,
@@ -806,6 +829,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 "norm_motion": density_info["norm_motion"],
                 "norm_complexity": density_info["norm_complexity"],
                 "density_score": float(density_score),
+                "predicted_tier": predicted_density_level,
+                "routing_override": self.routing_override,
                 "tier": density_level,
                 "tokens_allocated": int(N),
             })

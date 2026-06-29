@@ -94,6 +94,7 @@ class CausalWanSelfAttention(nn.Module):
         current_start=0,
         cache_start=None,
         mid_kv=None,
+        mid_kv_scale=1.0,
     ):
         r"""
         Args:
@@ -260,6 +261,9 @@ class CausalWanSelfAttention(nn.Module):
             if mid_kv is not None:
                 mid_k = mid_kv[0]  # (B, N_mid, n_heads, head_dim)
                 mid_v = mid_kv[1]  # (B, N_mid, n_heads, head_dim)
+                if mid_kv_scale != 1.0:
+                    mid_k = mid_k * mid_kv_scale
+                    mid_v = mid_v * mid_kv_scale
                 attn_k = torch.cat([sink_k, mid_k, recent_k], dim=1)
                 attn_v = torch.cat([sink_v, mid_v, recent_v], dim=1)
                 mid_len = mid_k.shape[1]
@@ -290,6 +294,7 @@ class CausalWanSelfAttention(nn.Module):
                     current_start_frame=current_start_frame,
                     sink_len=sink_k.shape[1],
                     mid_len=mid_len,
+                    mid_scale=float(mid_kv_scale),
                     recent_len=recent_k.shape[1],
                     total_len=attn_k.shape[1],
                     local_end_index=local_end_index,
@@ -365,6 +370,7 @@ class CausalWanAttentionBlock(nn.Module):
         current_start=0,
         cache_start=None,
         mid_kv=None,
+        mid_kv_scale=1.0,
     ):
         r"""
         Args:
@@ -385,7 +391,8 @@ class CausalWanAttentionBlock(nn.Module):
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start, mid_kv=mid_kv)
+            freqs, block_mask, kv_cache, current_start, cache_start,
+            mid_kv=mid_kv, mid_kv_scale=mid_kv_scale)
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -794,6 +801,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         current_start: int = 0,
         cache_start: int = 0,
         mid_kv_per_layer: list = None,
+        mid_kv_scale: float = 1.0,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -898,6 +906,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "current_start": current_start,
                         "cache_start": cache_start,
                         "mid_kv": _mid_kv,
+                        "mid_kv_scale": mid_kv_scale,
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -913,6 +922,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "current_start": current_start,
                         "cache_start": cache_start,
                         "mid_kv": _mid_kv,
+                        "mid_kv_scale": mid_kv_scale,
                     }
                 )
                 x = block(x, **kwargs)

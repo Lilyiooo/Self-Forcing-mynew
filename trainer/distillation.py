@@ -887,7 +887,13 @@ class Trainer:
         latent_h = getattr(compressor_train_cfg, "kv_distill_latent_H", 60)
         latent_w = getattr(compressor_train_cfg, "kv_distill_latent_W", 104)
         in_ch = getattr(getattr(self.config, "compressor", None), "in_ch", 16)
-        density_level = getattr(compressor_train_cfg, "kv_distill_density_level", "mid")
+        density_level_cfg = getattr(compressor_train_cfg, "kv_distill_density_level", "mid")
+        density_level_choices = ["high", "mid", "low"]
+        if isinstance(density_level_cfg, str) and density_level_cfg not in density_level_choices + ["mixed", "random"]:
+            raise ValueError(
+                f"Unsupported kv_distill_density_level={density_level_cfg!r}; "
+                "expected one of high/mid/low/mixed/random."
+            )
         k_weight = getattr(compressor_train_cfg, "kv_distill_k_weight", 1.0)
         v_weight = getattr(compressor_train_cfg, "kv_distill_v_weight", 1.0)
         cosine_weight = getattr(compressor_train_cfg, "kv_distill_cosine_weight", 0.1)
@@ -898,6 +904,13 @@ class Trainer:
         attn_context_replacement = getattr(
             compressor_train_cfg, "kv_distill_attn_context_replacement", False
         )
+        mid_scale_min = float(getattr(compressor_train_cfg, "kv_distill_mid_scale_min", 1.0))
+        mid_scale_max = float(getattr(compressor_train_cfg, "kv_distill_mid_scale_max", mid_scale_min))
+        if mid_scale_max < mid_scale_min:
+            raise ValueError(
+                f"kv_distill_mid_scale_max={mid_scale_max} must be >= "
+                f"kv_distill_mid_scale_min={mid_scale_min}"
+            )
         query_sampling = getattr(compressor_train_cfg, "kv_distill_query_sampling", "uniform")
         query_grid_h = getattr(compressor_train_cfg, "kv_distill_query_grid_h", 4)
         query_grid_w = getattr(compressor_train_cfg, "kv_distill_query_grid_w", 4)
@@ -913,7 +926,7 @@ class Trainer:
             compressor_train_cfg, "kv_distill_num_replaced_blocks", 1
         )))
         multi_target_prob = float(getattr(
-            compressor_train_cfg, "kv_distill_multi_target_prob", 1.0
+            compressor_train_cfg, "kv_distill_multi_target_prob", 0.3
         ))
         replace_min_gap_blocks = max(1, int(getattr(
             compressor_train_cfg, "kv_distill_replace_min_gap_blocks", 1
@@ -975,9 +988,11 @@ class Trainer:
             )
             print(
                 f"  KV distill source={latent_source}, "
+                f"density_level={density_level_cfg}, "
                 f"attn_output_weight={attn_output_weight}, "
                 f"context_weight={context_weight}, "
                 f"attn_context_replacement={attn_context_replacement}, "
+                f"mid_scale_range=({mid_scale_min}, {mid_scale_max}), "
                 f"query_sampling={query_sampling}, query_grid={query_grid_h}x{query_grid_w}, "
                 f"spatial_ratio={spatial_ratio}, "
                 f"k_weight={k_weight}, v_weight={v_weight}, "
@@ -994,6 +1009,18 @@ class Trainer:
 
         self.compressor.train()
         for step_idx in range(num_steps):
+            if density_level_cfg in ("mixed", "random"):
+                # Cycle deterministically so all branches receive comparable updates
+                # across distributed ranks and resumed runs.
+                density_level = density_level_choices[step_idx % len(density_level_choices)]
+            else:
+                density_level = density_level_cfg
+            if mid_scale_max > mid_scale_min:
+                mid_scale = mid_scale_min + (
+                    mid_scale_max - mid_scale_min
+                ) * float(torch.rand((), device=self.device).item())
+            else:
+                mid_scale = mid_scale_min
             with torch.no_grad():
                 if prompt_pool:
                     text_prompts = [
@@ -1097,14 +1124,6 @@ class Trainer:
                             and primary_target_block - idx >= replace_min_gap_blocks
                             and primary_target_block - idx <= replace_max_gap_blocks
                         ]
-                        if len(valid_extra) < num_replaced_blocks - 1:
-                            valid_extra = [
-                                idx for idx in candidate_targets
-                                if idx != primary_target_block
-                                and abs(idx - primary_target_block) >= replace_min_gap_blocks
-                            ]
-                        if len(valid_extra) < num_replaced_blocks - 1:
-                            valid_extra = [idx for idx in candidate_targets if idx != primary_target_block]
                         if valid_extra:
                             perm = torch.randperm(len(valid_extra), device=self.device)
                             for perm_idx in perm[: max(0, num_replaced_blocks - 1)].detach().cpu().tolist():
@@ -1253,9 +1272,14 @@ class Trainer:
                         for target_idx in range(num_targets):
                             if layer_idx >= len(student_roped_kv_by_target[target_idx]):
                                 continue
+                            student_k = student_roped_kv_by_target[target_idx][layer_idx][0]
+                            student_v = student_roped_kv_by_target[target_idx][layer_idx][1]
+                            if mid_scale != 1.0:
+                                student_k = student_k * mid_scale
+                                student_v = student_v * mid_scale
                             replacements.append({
-                                "student_k": student_roped_kv_by_target[target_idx][layer_idx][0],
-                                "student_v": student_roped_kv_by_target[target_idx][layer_idx][1],
+                                "student_k": student_k,
+                                "student_v": student_v,
                                 "target_start_token": int(rope_start_frames[target_idx]) * (latent_h // 2) * (latent_w // 2),
                                 "target_num_tokens": target_num_tokens,
                             })
@@ -1274,19 +1298,38 @@ class Trainer:
                             attn_loss_weight = context_weight
                             context_replacement_used += 1
                     if attn_loss is None and attn_output_weight > 0:
-                        attn_loss = self._attention_output_distill_loss(
-                            teacher_q,
-                            teacher_roped_k,
-                            teacher_attn_v,
-                            student_roped_kv_by_target[0][layer_idx][0],
-                            student_roped_kv_by_target[0][layer_idx][1],
-                            num_query_tokens=attn_query_tokens,
-                            query_grid_shape=full_grid,
-                            query_sampling=query_sampling,
-                            query_grid_h=query_grid_h,
-                            query_grid_w=query_grid_w,
-                            spatial_ratio=spatial_ratio,
-                        )
+                        fallback_losses = []
+                        for target_idx in range(num_targets):
+                            if (
+                                target_idx >= len(captured_attns)
+                                or layer_idx >= len(captured_attns[target_idx])
+                                or target_idx >= len(student_roped_kv_by_target)
+                                or layer_idx >= len(student_roped_kv_by_target[target_idx])
+                            ):
+                                continue
+                            _, fallback_teacher_k, fallback_teacher_v = captured_attns[target_idx][layer_idx]
+                            fallback_student_k = student_roped_kv_by_target[target_idx][layer_idx][0]
+                            fallback_student_v = student_roped_kv_by_target[target_idx][layer_idx][1]
+                            if mid_scale != 1.0:
+                                fallback_student_k = fallback_student_k * mid_scale
+                                fallback_student_v = fallback_student_v * mid_scale
+                            fallback_loss = self._attention_output_distill_loss(
+                                teacher_q,
+                                fallback_teacher_k,
+                                fallback_teacher_v,
+                                fallback_student_k,
+                                fallback_student_v,
+                                num_query_tokens=attn_query_tokens,
+                                query_grid_shape=full_grid,
+                                query_sampling=query_sampling,
+                                query_grid_h=query_grid_h,
+                                query_grid_w=query_grid_w,
+                                spatial_ratio=spatial_ratio,
+                            )
+                            if fallback_loss is not None:
+                                fallback_losses.append(fallback_loss)
+                        if fallback_losses:
+                            attn_loss = torch.stack(fallback_losses).mean()
                         if attempted_context_replacement:
                             context_replacement_fallback += 1
                     if attn_loss is not None:
@@ -1306,6 +1349,8 @@ class Trainer:
             if step_idx % 10 == 0 and self.is_main_process:
                 print(
                     f"  KV distill step {step_idx}/{num_steps}, loss={loss.item():.6f}, "
+                    f"density_level={density_level}, "
+                    f"mid_scale={mid_scale:.3f}, "
                     f"targets={num_targets}, target_starts={rope_start_frames}, "
                     f"context_used={context_replacement_used}, "
                     f"context_fallback={context_replacement_fallback}, "
@@ -1635,6 +1680,18 @@ class Trainer:
             self.pretrain_compressor(num_steps=pretrain_steps)
             kv_distill_steps = getattr(compressor_cfg, "kv_distill_steps", 0)
             self.pretrain_compressor_kv_distill(num_steps=kv_distill_steps)
+            if (
+                getattr(compressor_cfg, "save_after_pretrain", False)
+                and not self.config.no_save
+            ):
+                torch.cuda.empty_cache()
+                self.save()
+                torch.cuda.empty_cache()
+            max_train_steps = getattr(self.config, "max_train_steps", None)
+            if max_train_steps is not None and int(max_train_steps) <= 0:
+                if self.is_main_process:
+                    print(f"[Debug] Reached max_train_steps={max_train_steps}, exiting after compressor pretrain.")
+                return
 
         while True:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0

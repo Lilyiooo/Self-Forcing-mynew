@@ -39,6 +39,8 @@ parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to generate per prompt")
 parser.add_argument("--save_with_index", action="store_true",
                     help="Whether to save the video using the index or prompt as the filename")
+parser.add_argument("--mid_scale", type=float, default=None,
+                    help="Override heterogeneous_cache.mid_scale for compressed mid KV strength")
 args = parser.parse_args()
 
 
@@ -78,6 +80,10 @@ torch.set_grad_enabled(False)
 config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load("configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
+if args.mid_scale is not None:
+    if getattr(config, "heterogeneous_cache", None) is None:
+        config.heterogeneous_cache = OmegaConf.create({})
+    config.heterogeneous_cache.mid_scale = float(args.mid_scale)
 if getattr(getattr(config, "heterogeneous_cache", None), "debug_log_cache", False) \
         and not getattr(config.heterogeneous_cache, "debug_log_path", None):
     config.heterogeneous_cache.debug_log_path = os.path.join(

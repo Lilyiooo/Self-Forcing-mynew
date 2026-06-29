@@ -227,6 +227,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         aug_t: Optional[torch.Tensor] = None,
         cache_start: Optional[int] = None,
         mid_kv_per_layer: Optional[list] = None,
+        mid_kv_scale: float = 1.0,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -248,6 +249,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 current_start=current_start,
                 cache_start=cache_start,
                 mid_kv_per_layer=mid_kv_per_layer,
+                mid_kv_scale=mid_kv_scale,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
