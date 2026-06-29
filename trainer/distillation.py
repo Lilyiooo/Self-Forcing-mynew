@@ -904,6 +904,15 @@ class Trainer:
         attn_context_replacement = getattr(
             compressor_train_cfg, "kv_distill_attn_context_replacement", False
         )
+        mid_scale_train_mode = getattr(
+            compressor_train_cfg, "kv_distill_mid_scale_train_mode", "none"
+        )
+        if mid_scale_train_mode != "none":
+            raise ValueError(
+                "Training-time mid_scale augmentation with direct teacher matching is disabled. "
+                "Use inference heterogeneous_cache.mid_scale for sweeps, or add a "
+                "consistency/V-only objective before enabling this."
+            )
         mid_scale_min = float(getattr(compressor_train_cfg, "kv_distill_mid_scale_min", 1.0))
         mid_scale_max = float(getattr(compressor_train_cfg, "kv_distill_mid_scale_max", mid_scale_min))
         if mid_scale_max < mid_scale_min:
@@ -992,6 +1001,7 @@ class Trainer:
                 f"attn_output_weight={attn_output_weight}, "
                 f"context_weight={context_weight}, "
                 f"attn_context_replacement={attn_context_replacement}, "
+                f"mid_scale_train_mode={mid_scale_train_mode}, "
                 f"mid_scale_range=({mid_scale_min}, {mid_scale_max}), "
                 f"query_sampling={query_sampling}, query_grid={query_grid_h}x{query_grid_w}, "
                 f"spatial_ratio={spatial_ratio}, "
@@ -1015,12 +1025,7 @@ class Trainer:
                 density_level = density_level_choices[step_idx % len(density_level_choices)]
             else:
                 density_level = density_level_cfg
-            if mid_scale_max > mid_scale_min:
-                mid_scale = mid_scale_min + (
-                    mid_scale_max - mid_scale_min
-                ) * float(torch.rand((), device=self.device).item())
-            else:
-                mid_scale = mid_scale_min
+            mid_scale = 1.0
             with torch.no_grad():
                 if prompt_pool:
                     text_prompts = [
@@ -1274,9 +1279,6 @@ class Trainer:
                                 continue
                             student_k = student_roped_kv_by_target[target_idx][layer_idx][0]
                             student_v = student_roped_kv_by_target[target_idx][layer_idx][1]
-                            if mid_scale != 1.0:
-                                student_k = student_k * mid_scale
-                                student_v = student_v * mid_scale
                             replacements.append({
                                 "student_k": student_k,
                                 "student_v": student_v,
@@ -1310,9 +1312,6 @@ class Trainer:
                             _, fallback_teacher_k, fallback_teacher_v = captured_attns[target_idx][layer_idx]
                             fallback_student_k = student_roped_kv_by_target[target_idx][layer_idx][0]
                             fallback_student_v = student_roped_kv_by_target[target_idx][layer_idx][1]
-                            if mid_scale != 1.0:
-                                fallback_student_k = fallback_student_k * mid_scale
-                                fallback_student_v = fallback_student_v * mid_scale
                             fallback_loss = self._attention_output_distill_loss(
                                 teacher_q,
                                 fallback_teacher_k,

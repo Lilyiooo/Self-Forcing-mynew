@@ -103,7 +103,10 @@ compressor_training:
   kv_distill_future_gap_max: 4
   kv_distill_num_replaced_blocks: 1
   kv_distill_multi_target_prob: 0.0
-  kv_distill_mid_scale_min: 0.5
+  # Keep training unscaled. The useful 0.5 scale is applied at inference time
+  # with heterogeneous_cache.mid_scale / inference.py --mid_scale.
+  kv_distill_mid_scale_train_mode: none
+  kv_distill_mid_scale_min: 1.0
   kv_distill_mid_scale_max: 1.0
   lambda_recon: 0.0
   warmup_steps: 100
