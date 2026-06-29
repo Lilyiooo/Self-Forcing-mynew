@@ -99,9 +99,12 @@ class CausalInferencePipeline(torch.nn.Module):
             self.query_affinity_replace_margin = getattr(top_k_cfg, "query_affinity_replace_margin", 0.0)
             self.query_affinity_max_age_blocks = getattr(top_k_cfg, "query_affinity_max_age_blocks", 0)
             self.mid_kv_scale = float(getattr(het_cfg, "mid_scale", 1.0))
+            self.mid_k_scale = float(getattr(het_cfg, "mid_k_scale", self.mid_kv_scale))
+            self.mid_v_scale = float(getattr(het_cfg, "mid_v_scale", self.mid_kv_scale))
             print(f"Heterogeneous KV cache enabled: Nsink={het_cfg.Nsink}, "
                   f"Nrecent={het_cfg.Nrecent}, Nmid_tokens={het_cfg.Nmid_tokens}, "
-                  f"mid_scale={self.mid_kv_scale}")
+                  f"mid_scale={self.mid_kv_scale}, "
+                  f"mid_k_scale={self.mid_k_scale}, mid_v_scale={self.mid_v_scale}")
 
             # Density estimator
             density_cfg = getattr(args, "density_estimator", None)
@@ -668,6 +671,8 @@ class CausalInferencePipeline(torch.nn.Module):
                     current_start=current_start_frame * self.frame_seq_length,
                     mid_kv_per_layer=mid_kv_per_layer,
                     mid_kv_scale=self.mid_kv_scale,
+                    mid_k_scale=self.mid_k_scale,
+                    mid_v_scale=self.mid_v_scale,
                 )
             else:
                 return self.generator(

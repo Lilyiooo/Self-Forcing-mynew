@@ -41,6 +41,10 @@ parser.add_argument("--save_with_index", action="store_true",
                     help="Whether to save the video using the index or prompt as the filename")
 parser.add_argument("--mid_scale", type=float, default=None,
                     help="Override heterogeneous_cache.mid_scale for compressed mid KV strength")
+parser.add_argument("--mid_k_scale", type=float, default=None,
+                    help="Override heterogeneous_cache.mid_k_scale for compressed mid key strength")
+parser.add_argument("--mid_v_scale", type=float, default=None,
+                    help="Override heterogeneous_cache.mid_v_scale for compressed mid value strength")
 args = parser.parse_args()
 
 
@@ -84,6 +88,14 @@ if args.mid_scale is not None:
     if getattr(config, "heterogeneous_cache", None) is None:
         config.heterogeneous_cache = OmegaConf.create({})
     config.heterogeneous_cache.mid_scale = float(args.mid_scale)
+if args.mid_k_scale is not None:
+    if getattr(config, "heterogeneous_cache", None) is None:
+        config.heterogeneous_cache = OmegaConf.create({})
+    config.heterogeneous_cache.mid_k_scale = float(args.mid_k_scale)
+if args.mid_v_scale is not None:
+    if getattr(config, "heterogeneous_cache", None) is None:
+        config.heterogeneous_cache = OmegaConf.create({})
+    config.heterogeneous_cache.mid_v_scale = float(args.mid_v_scale)
 if getattr(getattr(config, "heterogeneous_cache", None), "debug_log_cache", False) \
         and not getattr(config.heterogeneous_cache, "debug_log_path", None):
     config.heterogeneous_cache.debug_log_path = os.path.join(
